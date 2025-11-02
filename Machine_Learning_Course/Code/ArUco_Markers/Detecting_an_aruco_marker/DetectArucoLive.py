@@ -12,6 +12,8 @@ import cv2
 from cv2 import aruco
 import numpy as np
 from hand_press_detector import HandPressDetector
+from playsound import playsound
+import os
 
 # Details were taken from (L = 640 x W = 480) dimension resized image
 KNOWN_AREA = 25360
@@ -164,13 +166,23 @@ def get_piano_distance(corners) -> float:
         return -1
     return KNOWN_DISTANCE * (KNOWN_AREA / new_area) ** 0.5
     
-def main(camera_index:int):
+def run_piano(camera_index:int):
     """
     Main method to run the AR Piano Model.
     """
     cap = cv2.VideoCapture(camera_index)
     aruco_detector = init_detector()
     hand_press_detector = HandPressDetector()
+
+    sound_files = {
+        'A': os.path.join('References', 'CV-piano-main', 'CV-piano-main', 'piano_keys', 'key01.mp3'),
+        'B': os.path.join('References', 'CV-piano-main', 'CV-piano-main', 'piano_keys', 'key02.mp3'),
+        'C': os.path.join('References', 'CV-piano-main', 'CV-piano-main', 'piano_keys', 'key03.mp3'),
+        'D': os.path.join('References', 'CV-piano-main', 'CV-piano-main', 'piano_keys', 'key04.mp3'),
+        'E': os.path.join('References', 'CV-piano-main', 'CV-piano-main', 'piano_keys', 'key05.mp3'),
+        'F': os.path.join('References', 'CV-piano-main', 'CV-piano-main', 'piano_keys', 'key06.mp3'),
+        'G': os.path.join('References', 'CV-piano-main', 'CV-piano-main', 'piano_keys', 'key07.mp3'),
+    }
 
     if not cap.isOpened():
         print('Unable to access camera feed.')
@@ -206,6 +218,7 @@ def main(camera_index:int):
 
                             if pressed and key_hovered != 'NA':
                                 print(f'Key {key_hovered} pressed!')
+                                playsound(sound_files[key_hovered], block=False)
 
             cv2.imshow('HomePiano: My AR Piano', detected_image)
 
@@ -214,5 +227,3 @@ def main(camera_index:int):
         
         cap.release()
         cv2.destroyAllWindows()
-
-main(0)
