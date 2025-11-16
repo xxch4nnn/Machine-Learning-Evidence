@@ -24,8 +24,15 @@ def train_and_evaluate(features_csv):
 
     # Load the data
     df = pd.read_csv(features_csv)
-    X = df[['finger_velocity', 'finger_acceleration', 'finger_position_x', 'finger_position_y', 'finger_position_z', 'depth_feature', 'posture_feature', 'euclidean_distance', 'distance_from_wrist']]
-    y = df['ground_truth_label']
+    X = df[['depth_feature', 'tip_to_dip_distance',
+            'fingertip_to_wrist_distance', 'fingertip_to_palm_center_distance',
+            'tip_x', 'tip_y', 'tip_z',
+            'velocity_x', 'velocity_y', 'velocity_z',
+            'acceleration_x', 'acceleration_y', 'acceleration_z',
+            'relative_velocity_x', 'relative_velocity_y', 'relative_velocity_z',
+            'avg_velocity_x', 'avg_velocity_y', 'avg_velocity_z',
+            'avg_acceleration_x', 'avg_acceleration_y', 'avg_acceleration_z']]
+    y = df['is_press']
 
     # Split the data
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)

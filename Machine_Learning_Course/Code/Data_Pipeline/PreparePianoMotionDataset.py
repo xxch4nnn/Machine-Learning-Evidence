@@ -71,6 +71,11 @@ def extract_features(data_dir, output_csv):
 
             last_tip_coords = None
             last_velocity = None
+            last_wrist_coords = None
+
+            # For moving average
+            tip_velocities = []
+            tip_accelerations = []
 
             for json_file in sorted_json_files:
                 json_path = os.path.join(json_dir, json_file)
@@ -88,10 +93,13 @@ def extract_features(data_dir, output_csv):
                 joints_rh = get_3d_joints(mano_layer_rh, transl_rh, global_orient_rh, hand_pose_rh, betas_rh)
                 tip_rh_coords = joints_rh[7] # Index fingertip
                 dip_rh_coords = joints_rh[6] # Index DIP joint
+                wrist_coords = joints_rh[0] # Wrist joint
 
                 # Feature extraction
                 depth_feature = tip_rh_coords[2]
                 tip_to_dip_distance = np.linalg.norm(tip_rh_coords - dip_rh_coords)
+                fingertip_to_wrist_distance = np.linalg.norm(tip_rh_coords - wrist_coords)
+                fingertip_to_palm_center_distance = np.linalg.norm(tip_rh_coords - wrist_coords) # Using wrist as palm center
 
                 # Velocity and Acceleration
                 if last_tip_coords is not None:
@@ -104,9 +112,28 @@ def extract_features(data_dir, output_csv):
                     velocity = np.zeros(3)
                     acceleration = np.zeros(3)
 
+                if last_wrist_coords is not None:
+                    wrist_velocity = wrist_coords - last_wrist_coords
+                else:
+                    wrist_velocity = np.zeros(3)
+
+                relative_fingertip_velocity = velocity - wrist_velocity
+
                 # Update for next frame
                 last_tip_coords = tip_rh_coords
                 last_velocity = velocity
+                last_wrist_coords = wrist_coords
+
+                # Moving average
+                tip_velocities.append(velocity)
+                tip_accelerations.append(acceleration)
+                if len(tip_velocities) > 3:
+                    tip_velocities.pop(0)
+                    tip_accelerations.pop(0)
+
+                avg_velocity = np.mean(tip_velocities, axis=0)
+                avg_acceleration = np.mean(tip_accelerations, axis=0)
+
 
                 # Align with MIDI data to get ground truth label
                 fps = mano_params.get("fps", 30)
@@ -120,17 +147,25 @@ def extract_features(data_dir, output_csv):
 
                 features.append([
                     json_path, depth_feature, tip_to_dip_distance,
+                    fingertip_to_wrist_distance, fingertip_to_palm_center_distance,
                     tip_rh_coords[0], tip_rh_coords[1], tip_rh_coords[2],
                     velocity[0], velocity[1], velocity[2],
                     acceleration[0], acceleration[1], acceleration[2],
+                    relative_fingertip_velocity[0], relative_fingertip_velocity[1], relative_fingertip_velocity[2],
+                    avg_velocity[0], avg_velocity[1], avg_velocity[2],
+                    avg_acceleration[0], avg_acceleration[1], avg_acceleration[2],
                     is_press
                 ])
 
     columns = [
         "json_path", "depth_feature", "tip_to_dip_distance",
+        "fingertip_to_wrist_distance", "fingertip_to_palm_center_distance",
         "tip_x", "tip_y", "tip_z",
         "velocity_x", "velocity_y", "velocity_z",
         "acceleration_x", "acceleration_y", "acceleration_z",
+        "relative_velocity_x", "relative_velocity_y", "relative_velocity_z",
+        "avg_velocity_x", "avg_velocity_y", "avg_velocity_z",
+        "avg_acceleration_x", "avg_acceleration_y", "avg_acceleration_z",
         "is_press"
     ]
     df = pd.DataFrame(features, columns=columns)
