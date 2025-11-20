@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Dict, Tuple
 import time
 import logging
+import pickle
+import joblib
 
 from sklearn.model_selection import train_test_split, RandomizedSearchCV, cross_val_score
 from sklearn.preprocessing import StandardScaler
@@ -36,7 +38,7 @@ class PianoMotionMLPipeline:
     Compares SVM and Random Forest models with comprehensive evaluation.
     """
     
-    def __init__(self, features_csv: str, test_size: float = 0.2, random_state: int = 42):
+    def __init__(self, features_csv: str, test_size: float = 0.2, random_state: int = 42, predictive_mode: bool = False):
         """
         Initialize ML pipeline.
         
@@ -44,10 +46,12 @@ class PianoMotionMLPipeline:
             features_csv: Path to CSV file with extracted features
             test_size: Proportion of data for testing
             random_state: Random seed for reproducibility
+            predictive_mode: Whether to apply target engineering for predictive modeling
         """
         self.features_csv = Path(features_csv)
         self.test_size = test_size
         self.random_state = random_state
+        self.predictive_mode = predictive_mode
         
         self.X_train = None
         self.X_test = None
@@ -58,7 +62,92 @@ class PianoMotionMLPipeline:
         self.models = {}
         self.results = {}
         self.inference_times = {}
+        self.feature_names = []
         
+    def apply_target_engineering(self, df: pd.DataFrame, shift_frames: int = 3) -> pd.DataFrame:
+        """
+        Shifts labels backward to create predictive targets.
+
+        Example:
+          Frame 100: Acceleration spike (label=0 originally)
+          Frame 103: Actual contact (label=1 originally)
+
+        After shift:
+          Frame 100: label=1 (model learns to predict from acceleration)
+          Frame 103: label=0 (ignored during training)
+        """
+        logger.info(f"Applying target engineering: shifting labels by -{shift_frames} frames")
+        df_shifted = df.copy()
+
+        # Ensure dataframe is sorted by some sequential logic if available,
+        # but assuming input is already sequential from SyncPianoMotionDataset
+
+        # Group by finger (implied by structure, or if we had a finger column)
+        # In the current dataset, rows are sequential frames mixed with finger info?
+        # Wait, SyncPianoMotionDataset outputs a flat list of features where each row is ONE finger at ONE frame.
+        # But the order is loop: for frame -> for finger.
+        # So it's F1_t1, F2_t1, F3_t1, F4_t1, F5_t1, F1_t2...
+        # To shift correctly, we must group by finger index or ID if available.
+        # Looking at SyncPianoMotionDataset:
+        # for frame_idx in range(num_frames):
+        #   for finger_i ...:
+        #     features['ground_truth_label'] = ...
+        #     all_features.append(features)
+
+        # The dataset doesn't explicitly have a 'finger_id' column in the feature set I saw in read_file,
+        # but let's check the saved feature columns in load_and_prepare_data.
+        # SyncPianoMotionDataset saves: ... all the features ...
+        # It does NOT seem to save 'finger_id' or 'finger_index'.
+        # This makes shifting tricky if we don't reconstruct the sequence.
+
+        # However, the rows are ordered: Frame 0 Finger 0, Frame 0 Finger 1, ...
+        # We can add a temporary index or just assume the pattern.
+        # Ideally, we should have added 'finger_index' in SyncPianoMotionDataset.
+        # But for now, if we assume 5 fingers per frame, we can slice.
+
+        # Wait, if we don't have finger ID, shifting just by -3 rows would shift data from Finger 3 to Finger 0 of next frame? No.
+        # We need to shift temporally for the SAME finger.
+
+        # Let's try to infer or if the user provided code assumes a 'finger' column.
+        # User provided:
+        # for finger in df['finger'].unique():
+        #    mask = df['finger'] == finger
+        #    df_shifted.loc[mask, 'label'] = ...
+
+        # My generated dataset might not have 'finger' column.
+        # Let's check the SyncPianoMotionDataset again.
+        # It does NOT add 'finger_index' to the dict.
+
+        # CRITICAL: I need to handle this.
+        # Since I cannot easily change the dataset generation without re-running it (which I did, but didn't add the column),
+        # I will reconstruct the finger index.
+        # There are always 5 fingers per frame.
+        # df['finger_index'] = df.index % 5
+        # This assumes the data is perfectly ordered.
+
+        df['temp_finger_index'] = df.index % 5
+
+        for finger in df['temp_finger_index'].unique():
+            mask = df['temp_finger_index'] == finger
+            # Shift the label column for this finger
+            # We need to ensure we are shifting along time.
+            # Since the data is interleaved (F0, F1, F2, F3, F4), filtering by finger gives us the time series for that finger.
+
+            # Get the labels for this finger
+            finger_labels = df.loc[mask, 'ground_truth_label']
+
+            # Shift
+            shifted_labels = finger_labels.shift(-shift_frames, fill_value=0)
+
+            # Assign back
+            df_shifted.loc[mask, 'ground_truth_label'] = shifted_labels
+
+        # Clean up
+        df_shifted.drop(columns=['temp_finger_index'], inplace=True, errors='ignore')
+        df.drop(columns=['temp_finger_index'], inplace=True, errors='ignore')
+
+        return df_shifted
+
     def load_and_prepare_data(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         Load features from CSV and split into train/test sets.
@@ -81,6 +170,10 @@ class PianoMotionMLPipeline:
         if label_col not in df.columns:
             raise ValueError(f"Label column '{label_col}' not found in CSV")
         
+        # Apply Predictive Target Engineering if enabled
+        if self.predictive_mode:
+            df = self.apply_target_engineering(df, shift_frames=3)
+
         # Explicitly define feature columns
         feature_cols = [
             'finger_velocity_x', 'finger_velocity_y', 'finger_velocity_z',
@@ -93,6 +186,10 @@ class PianoMotionMLPipeline:
             'avg_velocity_x', 'avg_velocity_y', 'avg_velocity_z',
             'avg_acceleration_x', 'avg_acceleration_y', 'avg_acceleration_z'
         ]
+
+        # Store feature names for serialization
+        self.feature_names = feature_cols
+
         X = df[feature_cols]
         y = df[label_col]
         
@@ -431,6 +528,38 @@ class PianoMotionMLPipeline:
         
         return str(output_dir)
     
+    def save_artifacts(self, output_dir: Path):
+        """
+        Save model artifacts (scaler, models, feature names).
+
+        Args:
+            output_dir: Directory to save artifacts
+        """
+        models_dir = output_dir.parent / "models" # Save to Data/PianoMotion10M/models
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        suffix = "_predictive" if self.predictive_mode else ""
+
+        # Save Random Forest model
+        if 'Random Forest' in self.models:
+            rf_path = models_dir / f"rf_model{suffix}.pkl"
+            with open(rf_path, 'wb') as f:
+                pickle.dump(self.models['Random Forest'], f)
+            logger.info(f"✅ Saved Random Forest model to {rf_path}")
+
+        # Save Scaler
+        scaler_path = models_dir / f"scaler{suffix}.pkl"
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(self.scaler, f)
+        logger.info(f"✅ Saved Scaler to {scaler_path}")
+
+        # Save Feature Names
+        features_path = models_dir / "feature_names.pkl"
+        with open(features_path, 'wb') as f:
+            pickle.dump(self.feature_names, f)
+        logger.info(f"✅ Saved Feature Names to {features_path}")
+
+
     def run_pipeline(self, output_dir: str = None) -> str:
         """
         Execute complete ML pipeline.
@@ -442,13 +571,15 @@ class PianoMotionMLPipeline:
             Path to output directory with results
         """
         if output_dir is None:
-            output_dir = self.features_csv.parent / "results"
+            subdir = "results_predictive" if self.predictive_mode else "results"
+            output_dir = self.features_csv.parent / subdir
         
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
         logger.info("\n" + "="*60)
-        logger.info("🚀 STARTING PIANOMOTION ML PIPELINE")
+        mode_str = "PREDICTIVE" if self.predictive_mode else "STANDARD"
+        logger.info(f"🚀 STARTING PIANOMOTION ML PIPELINE ({mode_str} MODE)")
         logger.info("="*60)
         
         try:
@@ -472,6 +603,9 @@ class PianoMotionMLPipeline:
             # Visualize results
             self.visualize_results(str(output_dir))
             
+            # Save artifacts
+            self.save_artifacts(output_dir)
+
             logger.info("\n" + "="*60)
             logger.info("✅ PIPELINE COMPLETE")
             logger.info("="*60)
@@ -489,13 +623,20 @@ def main():
     
     # Define paths
     features_csv = Path(__file__).parent.parent.parent / "Data" / "PianoMotion10M" / "features.csv"
-    output_dir = Path(__file__).parent.parent.parent / "Data" / "PianoMotion10M" / "results"
+
+    # Run in Predictive Mode by default for Phase B
+    predictive_mode = True
     
     # Create pipeline
-    pipeline = PianoMotionMLPipeline(str(features_csv), test_size=0.2, random_state=42)
+    pipeline = PianoMotionMLPipeline(
+        str(features_csv),
+        test_size=0.2,
+        random_state=42,
+        predictive_mode=predictive_mode
+    )
     
     # Run pipeline
-    results_dir = pipeline.run_pipeline(str(output_dir))
+    results_dir = pipeline.run_pipeline()
     
     print(f"\n🎉 All results saved to: {results_dir}")
 
