@@ -49,11 +49,13 @@ def validate_output():
     label_counts = df['ground_truth_label'].value_counts()
     print(f"Label distribution:\n{label_counts}")
 
-    if 1.0 not in label_counts:
-        print("⚠️  WARNING: No positive labels (presses) found! Check chord grouping logic.")
-        # We might treat this as an error if we expect the sample to have presses
-        # The sample file BV1Jf421Z732.mid definitely has notes.
-        raise ValueError("Dataset contains no positive labels.")
+    unique_labels = set(df['ground_truth_label'].unique())
+    required_labels = {0.0, 1.0, 2.0, 3.0}
+
+    # Check if all required labels are present in the dataset
+    if not required_labels.issubset(unique_labels):
+        missing = required_labels - unique_labels
+        raise ValueError(f"CRITICAL DATA ERROR: Missing classes {missing} in output.")
 
     # Check for NaN
     if df.isnull().values.any():

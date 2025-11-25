@@ -220,11 +220,36 @@ class SyncPianoMotionDataset:
                         note_start = event['start']
                         note_end = event['end']
 
-                        # Clamp frames
-                        note_start = max(0, min(note_start, num_frames))
+                        # Clamp frames to be within the valid range of the labels array
+                        note_start = max(0, min(note_start, num_frames - 1))
                         note_end = max(0, min(note_end, num_frames))
 
-                        labels[note_start:note_end, finger_idx] = 1
+                        # Skip if the note is invalid or has zero duration
+                        if note_start >= note_end:
+                            continue
+
+                        duration = note_end - note_start
+                        press_window = 3
+                        release_window = 3
+
+                        # --- 4-State Labeling Logic ---
+                        if duration >= (press_window + release_window):
+                            # Case 1: Long note with Press, Hold, and Release states
+                            # State 1: Press
+                            labels[note_start : note_start + press_window, finger_idx] = 1
+                            # State 2: Hold
+                            labels[note_start + press_window : note_end - release_window, finger_idx] = 2
+                            # State 3: Release
+                            labels[note_end - release_window : note_end, finger_idx] = 3
+                        else:
+                            # Case 2: Short note, prioritize Press then Release
+                            # Calculate midpoint, giving extra frame to Press for odd durations
+                            midpoint = int(np.ceil(duration / 2.0))
+
+                            # State 1: Press
+                            labels[note_start : note_start + midpoint, finger_idx] = 1
+                            # State 3: Release
+                            labels[note_start + midpoint : note_end, finger_idx] = 3
 
         # --- 2. Feature Extraction (Vectorized) ---
         # Pre-calculate all raw values to support rolling averages and relative features
