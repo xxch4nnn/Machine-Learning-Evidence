@@ -9,14 +9,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 import time
 import logging
+import joblib
 
 from sklearn.model_selection import train_test_split, RandomizedSearchCV, cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import RFE
 from sklearn.metrics import (
     confusion_matrix, accuracy_score, precision_score, recall_score, 
     f1_score, roc_auc_score, roc_curve, auc, classification_report
@@ -49,6 +51,9 @@ class PianoMotionMLPipeline:
         self.test_size = test_size
         self.random_state = random_state
         
+        self.models_dir = self.features_csv.parent / "models"
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+
         self.X_train = None
         self.X_test = None
         self.y_train = None
@@ -58,13 +63,15 @@ class PianoMotionMLPipeline:
         self.models = {}
         self.results = {}
         self.inference_times = {}
+        self.feature_names = None
+        self.selected_feature_names = None
         
-    def load_and_prepare_data(self) -> Tuple[np.ndarray, np.ndarray]:
+    def load_and_prepare_data(self) -> Tuple[np.ndarray, np.ndarray, pd.Series, pd.Series]:
         """
         Load features from CSV and split into train/test sets.
         
         Returns:
-            Tuple of (X_train_scaled, X_test_scaled)
+            Tuple of (X_train, X_test, y_train, y_test)
         """
         logger.info(f"Loading dataset from {self.features_csv}")
         
@@ -93,10 +100,22 @@ class PianoMotionMLPipeline:
             'avg_velocity_x', 'avg_velocity_y', 'avg_velocity_z',
             'avg_acceleration_x', 'avg_acceleration_y', 'avg_acceleration_z'
         ]
-        X = df[feature_cols]
+
+        # Add lag features if present in CSV but not in list
+        possible_lag_features = [col for col in df.columns if 'lag' in col or 'rolling' in col]
+        for col in possible_lag_features:
+            if col not in feature_cols and col != label_col:
+                feature_cols.append(col)
+
+        # Check if all columns exist
+        existing_cols = [col for col in feature_cols if col in df.columns]
+
+        X = df[existing_cols]
         y = df[label_col]
         
-        logger.info(f"Features: {list(X.columns)}")
+        self.feature_names = existing_cols
+
+        logger.info(f"Features: {self.feature_names}")
         logger.info(f"Label distribution: {y.value_counts().to_dict()}")
         
         # Handle missing values
@@ -110,13 +129,56 @@ class PianoMotionMLPipeline:
         logger.info(f"Train set: {len(self.X_train)} samples")
         logger.info(f"Test set: {len(self.X_test)} samples")
         
-        # Scale features
-        X_train_scaled = self.scaler.fit_transform(self.X_train)
-        X_test_scaled = self.scaler.transform(self.X_test)
+        return self.X_train, self.X_test, self.y_train, self.y_test
+
+    def perform_rfe(self, X_train: pd.DataFrame, y_train: pd.Series) -> pd.Index:
+        """
+        Perform Recursive Feature Elimination to select top 20 features.
+
+        Args:
+            X_train: Training features
+            y_train: Training labels
+
+        Returns:
+            Index of selected feature names
+        """
+        logger.info("\n" + "="*60)
+        logger.info("🧹 FEATURE SELECTION: Recursive Feature Elimination (RFE)")
+        logger.info("="*60)
+
+        # Use Random Forest as estimator for RFE
+        rf_estimator = RandomForestClassifier(
+            n_estimators=100,
+            random_state=self.random_state,
+            class_weight='balanced',
+            n_jobs=-1
+        )
+
+        # Select top 20 features
+        n_features_to_select = 20
+        logger.info(f"Selecting top {n_features_to_select} features...")
+
+        start_time = time.time()
+        rfe = RFE(estimator=rf_estimator, n_features_to_select=n_features_to_select, step=1)
+        rfe.fit(X_train, y_train)
+        rfe_time = time.time() - start_time
+
+        # Get selected features
+        selected_mask = rfe.support_
+        selected_features = X_train.columns[selected_mask]
+        self.selected_feature_names = selected_features
         
-        logger.info("✅ Data loading and preparation complete")
+        logger.info(f"✅ RFE complete ({rfe_time:.2f}s)")
+        logger.info(f"Selected Features ({len(selected_features)}):")
+        for i, feat in enumerate(selected_features):
+            logger.info(f"  {i+1}. {feat}")
+
+        # Save selected features
+        features_path = self.models_dir / "selected_features.pkl"
+        joblib.dump(list(selected_features), features_path)
+        logger.info(f"✅ Selected features saved to: {features_path}")
         
-        return X_train_scaled, X_test_scaled
+        return selected_features
     
     def train_svm_with_tuning(self, X_train: np.ndarray, X_test: np.ndarray) -> SVC:
         """
@@ -141,8 +203,8 @@ class PianoMotionMLPipeline:
             'degree': [2, 3, 4],
         }
         
-        # Base SVM model
-        svm_base = SVC(probability=True, random_state=self.random_state)
+        # Base SVM model with class_weight='balanced'
+        svm_base = SVC(probability=True, random_state=self.random_state, class_weight='balanced')
         
         # RandomizedSearchCV for hyperparameter tuning
         logger.info("Running RandomizedSearchCV for SVM (20 iterations)...")
@@ -189,8 +251,8 @@ class PianoMotionMLPipeline:
             'max_features': ['sqrt', 'log2'],
         }
         
-        # Base Random Forest model
-        rf_base = RandomForestClassifier(random_state=self.random_state, n_jobs=-1)
+        # Base Random Forest model with class_weight='balanced'
+        rf_base = RandomForestClassifier(random_state=self.random_state, n_jobs=-1, class_weight='balanced')
         
         # RandomizedSearchCV for hyperparameter tuning
         logger.info("Running RandomizedSearchCV for RF (20 iterations)...")
@@ -233,14 +295,14 @@ class PianoMotionMLPipeline:
         inference_time = time.time() - start_time
         
         # Probabilities for ROC-AUC
-        y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else y_pred
+        y_proba = model.predict_proba(X_test)
         
         # Calculate metrics
         accuracy = accuracy_score(self.y_test, y_pred)
-        precision = precision_score(self.y_test, y_pred, zero_division=0)
-        recall = recall_score(self.y_test, y_pred, zero_division=0)
-        f1 = f1_score(self.y_test, y_pred, zero_division=0)
-        roc_auc = roc_auc_score(self.y_test, y_proba)
+        precision = precision_score(self.y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(self.y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(self.y_test, y_pred, average='weighted', zero_division=0)
+        roc_auc = roc_auc_score(self.y_test, y_proba, multi_class='ovr')
         
         # Inference speed (FPS) - protect against zero division
         fps = len(X_test) / inference_time if inference_time > 0 else float('inf')
@@ -248,6 +310,10 @@ class PianoMotionMLPipeline:
         # Confusion matrix
         cm = confusion_matrix(self.y_test, y_pred)
         
+        # Classification Report
+        report = classification_report(self.y_test, y_pred, target_names=['Hover', 'Press', 'Hold', 'Release'])
+        logger.info(f"\nClassification Report for {model_name}:\n{report}")
+
         metrics = {
             'accuracy': accuracy,
             'precision': precision,
@@ -329,6 +395,7 @@ class PianoMotionMLPipeline:
         
         # 1. Confusion Matrices
         models_list = list(self.results.keys())
+        class_names = ['Hover', 'Press', 'Hold', 'Release']
         
         for idx, model_name in enumerate(models_list[:2]):  # Only 2 models
             ax = axes[0, idx]
@@ -338,15 +405,15 @@ class PianoMotionMLPipeline:
             ax.set_title(f'{model_name} - Confusion Matrix')
             
             # Labels
-            tick_marks = np.arange(2)
+            tick_marks = np.arange(len(class_names))
             ax.set_xticks(tick_marks)
             ax.set_yticks(tick_marks)
-            ax.set_xticklabels(['Hover', 'Press'])
-            ax.set_yticklabels(['Hover', 'Press'])
+            ax.set_xticklabels(class_names)
+            ax.set_yticklabels(class_names)
             
             # Add text annotations
-            for i in range(2):
-                for j in range(2):
+            for i in range(len(class_names)):
+                for j in range(len(class_names)):
                     text = ax.text(j, i, f'{cm[i, j]}', ha='center', va='center', 
                                  color='white' if cm[i, j] > cm.max()/2 else 'black', fontweight='bold')
             
@@ -407,26 +474,13 @@ class PianoMotionMLPipeline:
         
         for model_name in models_list[:2]:
             metrics = self.results[model_name]
-            y_proba = metrics['y_proba']
+            # ROC AUC is OVR, so we don't have a single curve.
+            # We will plot the micro-average ROC curve if possible, or skip for multi-class simplicity
+            # For now, let's just note the AUC score in the title as plotted before.
+            # But since it's 4-class, the previous logic of plotting fpr/tpr directly won't work simply.
+            # We'll skip detailed ROC plotting for 4-class to avoid clutter, or implement micro-average.
+            pass
             
-            fpr, tpr, _ = roc_curve(self.y_test, y_proba)
-            roc_auc_val = metrics['roc_auc']
-            
-            ax2.plot(fpr, tpr, label=f'{model_name} (AUC={roc_auc_val:.4f})', linewidth=2)
-        
-        # Diagonal line
-        ax2.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random Classifier')
-        
-        ax2.set_xlabel('False Positive Rate')
-        ax2.set_ylabel('True Positive Rate')
-        ax2.set_title('ROC Curves - Piano Motion Classification')
-        ax2.legend(loc='lower right')
-        ax2.grid(alpha=0.3)
-        
-        roc_path = output_dir / "roc_curves.png"
-        plt.savefig(roc_path, dpi=300, bbox_inches='tight')
-        logger.info(f"✅ ROC curves saved: {roc_path}")
-        
         plt.close('all')
         
         return str(output_dir)
@@ -453,12 +507,34 @@ class PianoMotionMLPipeline:
         
         try:
             # Load and prepare data
-            X_train_scaled, X_test_scaled = self.load_and_prepare_data()
+            X_train_raw, X_test_raw, y_train, y_test = self.load_and_prepare_data()
+
+            # Perform RFE
+            selected_features = self.perform_rfe(X_train_raw, y_train)
+
+            # Filter datasets to selected features
+            X_train_selected = X_train_raw[selected_features]
+            X_test_selected = X_test_raw[selected_features]
+
+            # Scale features
+            logger.info("Scaling features...")
+            X_train_scaled = self.scaler.fit_transform(X_train_selected)
+            X_test_scaled = self.scaler.transform(X_test_selected)
+
+            # Save Scaler
+            scaler_path = self.models_dir / "scaler.pkl"
+            joblib.dump(self.scaler, scaler_path)
+            logger.info(f"✅ Scaler saved to: {scaler_path}")
             
             # Train models
             svm_model = self.train_svm_with_tuning(X_train_scaled, X_test_scaled)
             rf_model = self.train_rf_with_tuning(X_train_scaled, X_test_scaled)
             
+            # Save Random Forest Model (Preferred)
+            rf_path = self.models_dir / "rf_model.pkl"
+            joblib.dump(rf_model, rf_path)
+            logger.info(f"✅ Random Forest model saved to: {rf_path}")
+
             # Evaluate models
             self.evaluate_model('SVM', svm_model, X_test_scaled)
             self.evaluate_model('Random Forest', rf_model, X_test_scaled)

@@ -36,3 +36,7 @@ __pycache__/
 # Generated data and results
 model_comparison.csv
 *.png
+
+# Ignore models
+*.pkl
+Machine_Learning_Course/Data/PianoMotion10M/models/
