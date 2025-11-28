@@ -184,6 +184,11 @@ class SyncPianoMotionDataset:
         Extracts 26 features for all fingers and labels them based on MIDI events.
         Includes chord grouping logic and relative position features.
         """
+        from scipy.signal import savgol_filter
+
+        # Apply Savitzky-Golay filter for smoothing
+        kinematics = savgol_filter(kinematics, window_length=5, polyorder=2, axis=0)
+
         all_features = []
         num_frames = kinematics.shape[0]
         labels = np.zeros((num_frames, 5))  # Labels for 5 fingers: Thumb(0) to Pinky(4)
@@ -354,6 +359,31 @@ class SyncPianoMotionDataset:
                 features['avg_acceleration_y'] = avg_acc[1]
                 features['avg_acceleration_z'] = avg_acc[2]
 
+                # 11. Finger Speed (Magnitude of Velocity)
+                features['finger_speed'] = np.linalg.norm(tip_vel_abs)
+
+                # 12. Lag Features for Z-axis Velocity and Acceleration
+                for lag in [2, 4, 6]:
+                    if frame_idx >= lag:
+                        features[f'velocity_z_lag_{lag}'] = velocities[frame_idx - lag, tip_idx, 2]
+                    else:
+                        features[f'velocity_z_lag_{lag}'] = 0.0
+
+                for lag in [2, 4]:
+                    if frame_idx >= lag:
+                        features[f'acceleration_z_lag_{lag}'] = accelerations[frame_idx - lag, tip_idx, 2]
+                    else:
+                        features[f'acceleration_z_lag_{lag}'] = 0.0
+
+                # 13. Rolling Variance for Z-axis Velocity and Acceleration
+                # Window of 5 frames
+                start_w_var = max(0, frame_idx - 4)
+                window_vel_z = velocities[start_w_var : frame_idx+1, tip_idx, 2]
+                window_acc_z = accelerations[start_w_var : frame_idx+1, tip_idx, 2]
+
+                features['rolling_variance_velocity_z'] = np.var(window_vel_z)
+                features['rolling_variance_acceleration_z'] = np.var(window_acc_z)
+
                 # Label
                 features['ground_truth_label'] = labels[frame_idx, finger_i]
 
@@ -455,4 +485,4 @@ if __name__ == "__main__":
 
     # For the sample run, we point to the script dir where the sample files are
     processor = SyncPianoMotionDataset(dataset_dir=script_dir)
-    processor.run(max_files=5)
+    processor.run(max_files=None)

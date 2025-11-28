@@ -33,7 +33,8 @@ class PianoMotion10MDownloader:
     
     # GitHub URLs
     GITHUB_REPO = "https://github.com/agnJason/PianoMotion10M"
-    GITHUB_ZIP = "https://github.com/agnJason/PianoMotion10M/archive/refs/heads/main.zip"
+    GITHUB_ZIP = "https://zenodo.org/records/13297386/files/annotation.zip?download=1"
+    MIDI_ZIP_URL = "https://zenodo.org/records/13297386/files/midi.zip?download=1"
     
     # Expected dataset structure
     EXPECTED_STRUCTURE = {
@@ -80,45 +81,38 @@ class PianoMotion10MDownloader:
             logger.info("✅ Dataset already exists locally. Skipping download.")
             return True
         
-        zip_path = self.output_dir / "PianoMotion10M.zip"
-        
+        zip_files = {
+            "annotation.zip": self.GITHUB_ZIP,
+            "midi.zip": self.MIDI_ZIP_URL,
+        }
+
         try:
-            logger.info(f"\n📍 Source: {self.GITHUB_ZIP}")
-            logger.info(f"📁 Destination: {self.output_dir}")
-            logger.info("\n⏳ Downloading... (this may take a few minutes)")
-            
-            # Download with progress
-            def download_progress(block_num, block_size, total_size):
-                downloaded = block_num * block_size
-                percent = min(downloaded * 100 // total_size, 100)
-                mb_downloaded = downloaded / (1024*1024)
-                mb_total = total_size / (1024*1024)
-                print(f"\r   Progress: {percent}% ({mb_downloaded:.1f}MB / {mb_total:.1f}MB)", end="")
-            
-            urllib.request.urlretrieve(self.GITHUB_ZIP, zip_path, download_progress)
-            print("\n✅ Download complete!\n")
-            
-            # Extract
-            logger.info("📂 Extracting files...")
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(self.output_dir)
-            
-            # Move files from PianoMotion10M-main to parent
-            extracted_dir = self.output_dir / "PianoMotion10M-main"
-            if extracted_dir.exists():
-                logger.info("🔄 Reorganizing directory structure...")
-                for item in extracted_dir.iterdir():
-                    dest = self.output_dir / item.name
-                    if dest.exists():
-                        shutil.rmtree(dest) if dest.is_dir() else dest.unlink()
-                    shutil.move(str(item), str(dest))
-                shutil.rmtree(extracted_dir)
-            
-            # Clean up zip
-            zip_path.unlink()
-            
-            logger.info("✅ Extraction complete!\n")
-            
+            for zip_name, url in zip_files.items():
+                zip_path = self.output_dir / zip_name
+                logger.info(f"\n📍 Source: {url}")
+                logger.info(f"📁 Destination: {zip_path}")
+                logger.info(f"\n⏳ Downloading {zip_name}... (this may take a few minutes)")
+
+                # Download with progress
+                def download_progress(block_num, block_size, total_size):
+                    downloaded = block_num * block_size
+                    percent = min(downloaded * 100 // total_size, 100) if total_size > 0 else 0
+                    mb_downloaded = downloaded / (1024*1024)
+                    mb_total = total_size / (1024*1024) if total_size > 0 else 0
+                    print(f"\r   Progress: {percent}% ({mb_downloaded:.1f}MB / {mb_total:.1f}MB)", end="")
+
+                urllib.request.urlretrieve(url, zip_path, download_progress)
+                print(f"\n✅ {zip_name} download complete!\n")
+
+                # Extract
+                logger.info(f"📂 Extracting {zip_name}...")
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(self.output_dir)
+                logger.info(f"✅ {zip_name} extraction complete!\n")
+
+                # Clean up zip
+                zip_path.unlink()
+
             # Verify structure
             if self._verify_structure():
                 logger.info("✅ Dataset structure verified!")
@@ -126,7 +120,7 @@ class PianoMotion10MDownloader:
             else:
                 logger.warning("⚠️  Dataset structure incomplete")
                 return False
-        
+
         except Exception as e:
             logger.error(f"❌ Download failed: {e}")
             return False
@@ -141,7 +135,7 @@ class PianoMotion10MDownloader:
         logger.info("\n🔍 Verifying dataset structure...")
         
         # Check for main directories
-        required_dirs = ['data']
+        required_dirs = ['annotation', 'midi']
         found_all = True
         
         for req_dir in required_dirs:

@@ -37,6 +37,10 @@ def validate_output():
         'relative_velocity_x', 'relative_velocity_y', 'relative_velocity_z',
         'avg_velocity_x', 'avg_velocity_y', 'avg_velocity_z',
         'avg_acceleration_x', 'avg_acceleration_y', 'avg_acceleration_z',
+        'finger_speed',
+        'velocity_z_lag_2', 'velocity_z_lag_4', 'velocity_z_lag_6',
+        'acceleration_z_lag_2', 'acceleration_z_lag_4',
+        'rolling_variance_velocity_z', 'rolling_variance_acceleration_z',
         'ground_truth_label'
     ]
 
@@ -64,7 +68,7 @@ def validate_output():
         # Fill NaNs check
         # raise ValueError("Dataset contains NaNs")
 
-    print("✅ Validation successful: features.csv has the correct format and 26+1 columns.")
+    print("✅ Validation successful: features.csv has the correct format and 34+1 columns.")
 
 if __name__ == "__main__":
     try:
