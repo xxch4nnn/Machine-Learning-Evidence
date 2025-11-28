@@ -447,6 +447,12 @@ class SyncPianoMotionDataset:
 
                 if kinematics is not None and note_events:
                     features = self.extract_and_label_features(kinematics, note_events)
+
+                    # Add sequence_id to each feature row
+                    sequence_id = kinematics_file.stem
+                    for feature_row in features:
+                        feature_row['sequence_id'] = sequence_id
+
                     all_features.extend(features)
             else:
                 logger.warning(f"MIDI file not found for {kinematics_file} (Base: {base_name})")

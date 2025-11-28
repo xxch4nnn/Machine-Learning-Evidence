@@ -38,20 +38,26 @@ class PianoMotionMLPipeline:
     Compares SVM and Random Forest models with comprehensive evaluation.
     """
     
-    def __init__(self, features_csv: str, test_size: float = 0.2, random_state: int = 42):
+    def __init__(self, features_csv: str = None, dataframe: pd.DataFrame = None, test_size: float = 0.2, random_state: int = 42):
         """
         Initialize ML pipeline.
         
         Args:
             features_csv: Path to CSV file with extracted features
+            dataframe: Optional pandas DataFrame to use directly (bypasses CSV load)
             test_size: Proportion of data for testing
             random_state: Random seed for reproducibility
         """
-        self.features_csv = Path(features_csv)
+        self.features_csv = Path(features_csv) if features_csv else None
+        self.dataframe = dataframe
         self.test_size = test_size
         self.random_state = random_state
         
-        self.models_dir = self.features_csv.parent / "models"
+        if self.features_csv:
+            self.models_dir = self.features_csv.parent / "models"
+        else:
+            self.models_dir = Path("models")
+
         self.models_dir.mkdir(parents=True, exist_ok=True)
 
         self.X_train = None
@@ -68,19 +74,21 @@ class PianoMotionMLPipeline:
         
     def load_and_prepare_data(self) -> Tuple[np.ndarray, np.ndarray, pd.Series, pd.Series]:
         """
-        Load features from CSV and split into train/test sets.
+        Load features from CSV or DataFrame and split into train/test sets.
         
         Returns:
             Tuple of (X_train, X_test, y_train, y_test)
         """
-        logger.info(f"Loading dataset from {self.features_csv}")
-        
-        if not self.features_csv.exists():
+        if self.dataframe is not None:
+            logger.info("Loading dataset from memory (DataFrame)...")
+            df = self.dataframe.copy()
+        elif self.features_csv and self.features_csv.exists():
+            logger.info(f"Loading dataset from {self.features_csv}")
+            df = pd.read_csv(self.features_csv)
+        else:
             logger.error(f"Features file not found: {self.features_csv}")
             raise FileNotFoundError(f"Features CSV not found: {self.features_csv}")
         
-        # Load data
-        df = pd.read_csv(self.features_csv)
         logger.info(f"Loaded {len(df)} samples with {len(df.columns)} columns")
         
         # Separate features and labels
@@ -131,21 +139,42 @@ class PianoMotionMLPipeline:
         
         return self.X_train, self.X_test, self.y_train, self.y_test
 
-    def perform_rfe(self, X_train: pd.DataFrame, y_train: pd.Series) -> pd.Index:
+    def perform_rfe(self, X_train: pd.DataFrame, y_train: pd.Series, pre_selected_features: List[str] = None) -> pd.Index:
         """
         Perform Recursive Feature Elimination to select top 20 features.
+        Or use pre-selected features if provided.
 
         Args:
             X_train: Training features
             y_train: Training labels
+            pre_selected_features: Optional list of feature names to use directly
 
         Returns:
             Index of selected feature names
         """
         logger.info("\n" + "="*60)
-        logger.info("🧹 FEATURE SELECTION: Recursive Feature Elimination (RFE)")
+        logger.info("🧹 FEATURE SELECTION")
         logger.info("="*60)
 
+        if pre_selected_features is not None:
+            logger.info("Using pre-selected features (skipping RFE)...")
+            selected_features = pd.Index(pre_selected_features)
+
+            # Verify these features exist in X_train
+            missing = [f for f in selected_features if f not in X_train.columns]
+            if missing:
+                logger.warning(f"⚠️ Some pre-selected features are missing from data: {missing}")
+                selected_features = selected_features.intersection(X_train.columns)
+
+            self.selected_feature_names = selected_features
+
+            logger.info(f"Using {len(selected_features)} features:")
+            for i, feat in enumerate(selected_features):
+                logger.info(f"  {i+1}. {feat}")
+
+            return selected_features
+
+        logger.info("Running Recursive Feature Elimination (RFE)...")
         # Use Random Forest as estimator for RFE
         rf_estimator = RandomForestClassifier(
             n_estimators=100,
@@ -239,7 +268,7 @@ class PianoMotionMLPipeline:
             Trained Random Forest model
         """
         logger.info("\n" + "="*60)
-        logger.info("🤖 TRAINING: Random Forest (RF)")
+        logger.info("🤖 TRAINING: Random Forest (RF) - Tuning")
         logger.info("="*60)
         
         # Hyperparameter grid for RandomizedSearchCV
@@ -273,6 +302,39 @@ class PianoMotionMLPipeline:
         rf_model = rf_search.best_estimator_
         self.models['Random Forest'] = rf_model
         
+        return rf_model
+
+    def train_rf_fixed(self, X_train: np.ndarray, X_test: np.ndarray, params: Dict) -> RandomForestClassifier:
+        """
+        Train Random Forest with fixed hyperparameters (no tuning).
+
+        Args:
+            X_train: Training features (scaled)
+            X_test: Test features (scaled)
+            params: Dictionary of hyperparameters
+
+        Returns:
+            Trained Random Forest model
+        """
+        logger.info("\n" + "="*60)
+        logger.info("🤖 TRAINING: Random Forest (RF) - Fixed Params")
+        logger.info("="*60)
+        logger.info(f"Params: {params}")
+
+        rf_model = RandomForestClassifier(
+            random_state=self.random_state,
+            n_jobs=-1,
+            class_weight='balanced',
+            **params
+        )
+
+        start_time = time.time()
+        rf_model.fit(X_train, self.y_train)
+        train_time = time.time() - start_time
+
+        logger.info(f"✅ RF training complete ({train_time:.2f}s)")
+        self.models['Random Forest'] = rf_model
+
         return rf_model
     
     def evaluate_model(self, model_name: str, model, X_test: np.ndarray) -> Dict:
@@ -485,18 +547,24 @@ class PianoMotionMLPipeline:
         
         return str(output_dir)
     
-    def run_pipeline(self, output_dir: str = None) -> str:
+    def run_pipeline(self, output_dir: str = None, selected_features: List[str] = None, fixed_rf_params: Dict = None, skip_svm: bool = False) -> str:
         """
         Execute complete ML pipeline.
         
         Args:
             output_dir: Directory to save results and plots
+            selected_features: Optional list of features to use (skips RFE)
+            fixed_rf_params: Optional dict of RF params (skips tuning)
+            skip_svm: Whether to skip SVM training (useful for fast RF-only loops)
             
         Returns:
             Path to output directory with results
         """
         if output_dir is None:
-            output_dir = self.features_csv.parent / "results"
+            if self.features_csv:
+                output_dir = self.features_csv.parent / "results"
+            else:
+                output_dir = Path("results")
         
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -509,8 +577,8 @@ class PianoMotionMLPipeline:
             # Load and prepare data
             X_train_raw, X_test_raw, y_train, y_test = self.load_and_prepare_data()
 
-            # Perform RFE
-            selected_features = self.perform_rfe(X_train_raw, y_train)
+            # Perform RFE (or use pre-selected)
+            selected_features = self.perform_rfe(X_train_raw, y_train, pre_selected_features=selected_features)
 
             # Filter datasets to selected features
             X_train_selected = X_train_raw[selected_features]
@@ -527,8 +595,14 @@ class PianoMotionMLPipeline:
             logger.info(f"✅ Scaler saved to: {scaler_path}")
             
             # Train models
-            svm_model = self.train_svm_with_tuning(X_train_scaled, X_test_scaled)
-            rf_model = self.train_rf_with_tuning(X_train_scaled, X_test_scaled)
+            if not skip_svm:
+                svm_model = self.train_svm_with_tuning(X_train_scaled, X_test_scaled)
+                self.evaluate_model('SVM', svm_model, X_test_scaled)
+
+            if fixed_rf_params:
+                rf_model = self.train_rf_fixed(X_train_scaled, X_test_scaled, fixed_rf_params)
+            else:
+                rf_model = self.train_rf_with_tuning(X_train_scaled, X_test_scaled)
             
             # Save Random Forest Model (Preferred)
             rf_path = self.models_dir / "rf_model.pkl"
@@ -536,7 +610,6 @@ class PianoMotionMLPipeline:
             logger.info(f"✅ Random Forest model saved to: {rf_path}")
 
             # Evaluate models
-            self.evaluate_model('SVM', svm_model, X_test_scaled)
             self.evaluate_model('Random Forest', rf_model, X_test_scaled)
             
             # Compare models
