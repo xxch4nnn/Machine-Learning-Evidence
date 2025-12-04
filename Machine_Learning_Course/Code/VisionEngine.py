@@ -4,232 +4,190 @@ import threading
 import time
 from cv2 import aruco
 
+# --- DIGITAL TWIN CONFIGURATION (MUST MATCH GENERATOR) ---
+CONFIG = {
+    'MARKER_SIZE': 200.0,    # 3D Unit = 1 Pixel
+    'SAFETY_GAP': 50.0,
+    'BORDER_WIDTH': 20.0,
+    'KEY_WIDTH': 100.0,
+    'KEY_HEIGHT': 400.0,
+    'NUM_KEYS': 7
+}
+
 class ThreadedCamera:
-    """
-    A threaded camera class that uses the Producer-Consumer pattern.
-    The Producer (background thread) continuously reads frames from the camera.
-    The Consumer (main thread) reads the latest frame instantly.
-    """
+    """ Producer-Consumer Threaded Video Capture """
     def __init__(self, src=0):
         self.capture = cv2.VideoCapture(src)
-        # Verify camera opened
-        if not self.capture.isOpened():
-             print(f"Warning: Unable to open camera source {src}")
-
+        self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        
         self.lock = threading.Lock()
-        self._current_frame = None
-        self.is_running = True
-
-        # Read the first frame to ensure we have something to return
+        self._frame = None
+        self.running = True
+        
         success, frame = self.capture.read()
-        if success:
-            self._current_frame = frame
-
-        # Start the producer thread as a daemon
+        if success: self._frame = frame
+        
         self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
 
     def _update(self):
-        """
-        Producer Loop: continuously reads frames from the camera
-        and updates the shared _current_frame variable.
-        """
-        while self.is_running:
+        while self.running:
             if self.capture.isOpened():
-                success, frame = self.capture.read()
-                if success:
+                ret, frame = self.capture.read()
+                if ret:
                     with self.lock:
-                        self._current_frame = frame
+                        self._frame = frame
                 else:
-                    # If we can't read, maybe the camera disconnected or stream ended
                     time.sleep(0.01)
             else:
                 time.sleep(0.1)
 
     def read(self):
-        """
-        Consumer: returns the latest frame instantly.
-        """
         with self.lock:
-            return self._current_frame
+            return self._frame.copy() if self._frame is not None else None
 
     def stop(self):
-        """
-        Stops the thread and releases resources.
-        """
-        self.is_running = False
+        self.running = False
         self.thread.join()
         self.capture.release()
 
-def estimate_camera_matrix(frame_width, frame_height):
-    """
-    Estimates the camera matrix based on frame dimensions.
-    Focal Length = Frame Width
-    Center X = Frame Width / 2
-    Center Y = Frame Height / 2
-    """
-    focal_length = frame_width
-    center_x = frame_width / 2
-    center_y = frame_height / 2
+class VisionEngine:
+    def __init__(self, src=0):
+        self.cam = ThreadedCamera(src)
+        
+        # --- ARUCO CONFIG ---
+        self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+        self.params = aruco.DetectorParameters()
+        self.detector = aruco.ArucoDetector(self.aruco_dict, self.params)
+        
+        # --- 3D OBJECT POINTS DEFINITION ---
+        
+        # 1. Marker Object Points (The Anchor)
+        # Defined counter-clockwise from Top-Left to match ArUco detection order
+        # Origin (0,0,0) is the Top-Left corner of the marker
+        s = CONFIG['MARKER_SIZE']
+        self.marker_points = np.array([
+            [0, 0, 0],    # Top-Left
+            [s, 0, 0],    # Top-Right
+            [s, s, 0],    # Bot-Right
+            [0, s, 0]     # Bot-Left
+        ], dtype=np.float32)
+        
+        # 2. Piano Grid Points (Relative to Marker Origin)
+        self.piano_points, self.key_lines = self._generate_piano_points()
 
-    camera_matrix = np.array([
-        [focal_length, 0, center_x],
-        [0, focal_length, center_y],
-        [0, 0, 1]
-    ], dtype=np.float32)
+    def _generate_piano_points(self):
+        """ Replicates the Generator's layout math in 3D space (Z=0) """
+        
+        # Calculate X Offset: Marker + Gap + Border
+        start_x = CONFIG['MARKER_SIZE'] + CONFIG['SAFETY_GAP'] + CONFIG['BORDER_WIDTH']
+        
+        # Calculate Width
+        total_width = CONFIG['KEY_WIDTH'] * CONFIG['NUM_KEYS']
+        end_x = start_x + total_width
+        
+        # Y Dimensions (Top aligned with marker top)
+        y_top = 0.0
+        y_bot = CONFIG['KEY_HEIGHT']
+        
+        # A. The Bounding Box (Green Border)
+        outline = np.array([
+            [start_x, y_top, 0],  # TL
+            [end_x, y_top, 0],    # TR
+            [end_x, y_bot, 0],    # BR
+            [start_x, y_bot, 0]   # BL
+        ], dtype=np.float32)
+        
+        # B. Vertical Key Separators
+        lines = []
+        for i in range(1, CONFIG['NUM_KEYS']):
+            x = start_x + (i * CONFIG['KEY_WIDTH'])
+            lines.append([x, y_top, 0])
+            lines.append([x, y_bot, 0])
+            
+        return outline, np.array(lines, dtype=np.float32)
 
-    return camera_matrix
+    def estimate_intrinsics(self, w, h):
+        """ Basic assumption for uncalibrated camera """
+        f = w  # Focal length approx width
+        return np.array([[f, 0, w/2], [0, f, h/2], [0, 0, 1]], dtype=np.float32)
 
-def draw_3d_axis(image, corners, ids, camera_matrix, dist_coeffs):
-    """
-    Draws a 3D bounding box on the detected ArUco markers.
-    """
-    if ids is None or corners is None:
-        return image
+    def run(self):
+        print("Starting Vision Engine (Digital Twin Mode)...")
+        print("Looking for Left Marker (ID 0)...")
+        
+        prev_time = time.time()
+        fps_log = []
+        
+        try:
+            while True:
+                frame = self.cam.read()
+                if frame is None: continue
+                
+                h, w = frame.shape[:2]
+                cam_mat = self.estimate_intrinsics(w, h)
+                dist = np.zeros((4,1))
+                
+                # Detect
+                corners, ids, _ = self.detector.detectMarkers(frame)
+                
+                status = "Searching..."
+                color = (0, 0, 255) # Red
+                
+                if ids is not None:
+                    # Draw visual debug for all markers
+                    aruco.drawDetectedMarkers(frame, corners, ids)
+                    
+                    ids_flat = ids.flatten()
+                    if 0 in ids_flat:
+                        # FOUND ANCHOR
+                        status = "Tracking (Locked)"
+                        color = (0, 255, 0) # Green
+                        
+                        idx = np.where(ids_flat == 0)[0][0]
+                        c0 = corners[idx].reshape((4, 2))
+                        
+                        # 1. Get Pose of Marker 0 relative to Camera
+                        success, rvec, tvec = cv2.solvePnP(self.marker_points, c0, cam_mat, dist)
+                        
+                        if success:
+                            # 2. Project Piano Outline
+                            img_pts_border, _ = cv2.projectPoints(self.piano_points, rvec, tvec, cam_mat, dist)
+                            img_pts_border = np.int32(img_pts_border).reshape(-1, 2)
+                            
+                            # Draw Green Box
+                            cv2.polylines(frame, [img_pts_border], True, (0, 255, 0), 2)
+                            
+                            # 3. Project & Draw Key Lines
+                            if len(self.key_lines) > 0:
+                                key_pts, _ = cv2.projectPoints(self.key_lines, rvec, tvec, cam_mat, dist)
+                                key_pts = np.int32(key_pts).reshape(-1, 2)
+                                
+                                for k in range(0, len(key_pts), 2):
+                                    cv2.line(frame, tuple(key_pts[k]), tuple(key_pts[k+1]), (0, 255, 0), 1)
+                                    
+                            # 4. Draw Axis on Anchor (Visual Verification)
+                            cv2.drawFrameAxes(frame, cam_mat, dist, rvec, tvec, 100.0)
 
-    # Define a 3D box in the marker's local coordinate space
-    # z=0 is the surface, z=0.1 is protruding out (assuming marker length 1.0 logic roughly)
-    # Adjust scale as needed for visualization.
-    # Let's assume marker size is roughly 1 unit for the box definition or normalized.
-    # The user asked for "z=0 to z=0.1".
-    # Standard corners are often normalized, but let's define a box relative to the marker square.
-    # Marker corners in local space are often: (-0.5, 0.5, 0), (0.5, 0.5, 0), (0.5, -0.5, 0), (-0.5, -0.5, 0) if centered
-    # OR (0,0,0), (1,0,0), (1,1,0), (0,1,0) depending on convention.
-    # solvePnP generic object points for a square marker:
-    marker_length = 0.05 # 5cm example, or just unitless 1.0.
-    # The visual size depends on the object points defined here matching the physical size in tvec units,
-    # OR we just use a consistent relative scale.
-    # Let's use a normalized coordinate system for the marker:
-    # Top-Left: (0,0,0), Top-Right: (1,0,0), Bottom-Right: (1,1,0), Bottom-Left: (0,1,0)
-    # The `corners` from detectMarkers are typically TopLeft, TopRight, BottomRight, BottomLeft.
-
-    obj_points = np.array([
-        [0, 0, 0],
-        [1, 0, 0],
-        [1, 1, 0],
-        [0, 1, 0]
-    ], dtype=np.float32)
-
-    # We iterate through each detected marker
-    for i in range(len(ids)):
-        # Get corners for this marker
-        # corners[i] shape is (1, 4, 2)
-        current_corners = corners[i].reshape((4, 2))
-
-        # Calculate Pose
-        success, rvec, tvec = cv2.solvePnP(obj_points, current_corners, camera_matrix, dist_coeffs)
-
-        if success:
-            # Define 3D Box points to project
-            # Base (z=0) is already the corners. Top (z=-0.5) - Z axis usually points OUT or IN?
-            # In OpenCV, Z is forward. For a flat marker on a table, Z is usually up/down relative to camera.
-            # Usually we define the box protruding 'up' from the marker.
-            # If Z points into the scene, 'up' from the marker surface might be negative Z in local space?
-            # Let's try drawing a box from z=0 to z=-1 (negative usually towards camera in local marker frame if Z is down? No.)
-            # Standard: X right, Y down, Z forward (camera).
-            # For marker: X right, Y up, Z forward (out of board)?
-            # Let's stick to the prompt: "z=0 to z=0.1".
-
-            # The prompt says: "z=0 to z=0.1". I will follow that literally.
-
-            box_points_3d = np.array([
-                [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],       # Base
-                [0, 0, 0.1], [1, 0, 0.1], [1, 1, 0.1], [0, 1, 0.1] # Top
-            ], dtype=np.float32)
-
-            # Project points
-            img_points, _ = cv2.projectPoints(box_points_3d, rvec, tvec, camera_matrix, dist_coeffs)
-            img_points = np.int32(img_points).reshape(-1, 2)
-
-            # Draw Base
-            cv2.drawContours(image, [img_points[:4]], -1, (0, 255, 0), 2)
-
-            # Draw Pillars
-            for j in range(4):
-                cv2.line(image, tuple(img_points[j]), tuple(img_points[j+4]), (255, 0, 0), 2)
-
-            # Draw Top
-            cv2.drawContours(image, [img_points[4:]], -1, (0, 0, 255), 2)
-
-    return image
-
-def main():
-    # Initialize Camera
-    # Try index 0, then 1 if needed. The user used 1 in their legacy code.
-    # I'll default to 0, but user can change.
-    camera_src = 0
-    camera = ThreadedCamera(src=camera_src)
-
-    # Initialize ArUco
-    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-    parameters = aruco.DetectorParameters()
-    detector = aruco.ArucoDetector(aruco_dict, parameters)
-
-    # FPS Variables
-    prev_time = time.time()
-    fps_history = []
-
-    print("Starting Vision Engine...")
-    print("Press 'q' to quit.")
-
-    try:
-        while True:
-            frame = camera.read()
-            if frame is None:
-                time.sleep(0.1)
-                continue
-
-            # Calculate FPS
-            curr_time = time.time()
-            dt = curr_time - prev_time
-            prev_time = curr_time
-
-            # Avoid division by zero
-            if dt > 0:
-                fps = 1.0 / dt
-                fps_history.append(fps)
-                if len(fps_history) > 30: # Rolling average window
-                    fps_history.pop(0)
-                avg_fps = sum(fps_history) / len(fps_history)
-            else:
-                avg_fps = 0
-
-            # Process Frame
-            height, width = frame.shape[:2]
-
-            # Estimate Camera Matrix
-            camera_matrix = estimate_camera_matrix(width, height)
-            dist_coeffs = np.zeros((4, 1)) # Assuming no distortion for basic estimation
-
-            # Detect Markers
-            # Detect markers needs grayscale? detectMarkers handles it usually, but let's be safe.
-            # gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # Actually ArucoDetector.detectMarkers can take color, but gray is standard.
-            corners, ids, rejected = detector.detectMarkers(frame)
-
-            # Visualization
-            if ids is not None:
-                # Draw standard markers
-                aruco.drawDetectedMarkers(frame, corners, ids)
-
-                # Draw 3D Boxes
-                frame = draw_3d_axis(frame, corners, ids, camera_matrix, dist_coeffs)
-
-            # Draw FPS
-            cv2.putText(frame, f"FPS: {int(avg_fps)}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-            # Show Frame
-            cv2.imshow('Vision Engine - 3D Threaded', frame)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-    except KeyboardInterrupt:
-        print("Stopping...")
-    finally:
-        camera.stop()
-        cv2.destroyAllWindows()
+                # UI Overlay
+                curr = time.time()
+                dt = curr - prev_time
+                prev_time = curr
+                if dt > 0:
+                    fps_log.append(1.0/dt)
+                    if len(fps_log) > 30: fps_log.pop(0)
+                    fps = sum(fps_log)/len(fps_log)
+                else: fps = 0
+                
+                cv2.putText(frame, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Status: {status}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                cv2.imshow("Vision Engine", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+                
+        finally:
+            self.cam.stop()
+            cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    main()
+    VisionEngine().run()

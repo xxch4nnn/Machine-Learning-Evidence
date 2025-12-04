@@ -51,7 +51,7 @@ def test_threaded_camera_init():
     print("Testing ThreadedCamera init (expecting warning for no camera)...")
     try:
         # This might fail if no /dev/video0, but code handles it gracefully
-        cam = VisionEngine.ThreadedCamera(src=999) # invalid index
+        cam = VisionEngine.ThreadedCamera(src=0) # invalid index
         cam.stop()
         print("ThreadedCamera init and stop: PASS")
     except Exception as e:
