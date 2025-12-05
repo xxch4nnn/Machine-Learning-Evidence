@@ -28,6 +28,7 @@ replay_pid*
 
 Piano_Recordings*
 Machine_Learning_Course/Code/ArUco_Markers/Detecting_an_aruco_marker/DetectArucoLive_Waks.py
+Machine_Learning_Course/Trial Recordings
 
 # Ignore large data file
 Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/features.csv
@@ -35,8 +36,6 @@ Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/annotation
 Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/experiments
 Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/midi
 Machine_Learning_Course/Data/PianoMotion10M
-*.csv
-*.json
 
 # Python cache
 __pycache__/
