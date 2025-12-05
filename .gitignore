@@ -19,6 +19,9 @@
 *.tar.gz
 *.rar
 
+# Videos
+*.mp4
+
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
@@ -32,6 +35,8 @@ Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/annotation
 Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/experiments
 Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/midi
 Machine_Learning_Course/Data/PianoMotion10M
+*.csv
+*.json
 
 # Python cache
 __pycache__/
