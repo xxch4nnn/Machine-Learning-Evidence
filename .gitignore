@@ -28,6 +28,10 @@ Machine_Learning_Course/Code/ArUco_Markers/Detecting_an_aruco_marker/DetectAruco
 
 # Ignore large data file
 Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/features.csv
+Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/annotation
+Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/experiments
+Machine_Learning_Course/Code/Data_Pipeline/PianoMotion10M/midi
+Machine_Learning_Course/Data/PianoMotion10M
 
 # Python cache
 __pycache__/
