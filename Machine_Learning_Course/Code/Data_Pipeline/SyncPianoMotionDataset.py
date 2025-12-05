@@ -106,6 +106,7 @@ def extract_features(kinematics_3d: np.ndarray, note_events: List, seq_id: str) 
     """
     Extracts 2D Features from 3D Kinematics.
     Labels using Group & Rank heuristic.
+    IMPROVED: Robust smoothing and outlier handling for velocity/acceleration.
     """
     if kinematics_3d is None or len(kinematics_3d) == 0:
         return pd.DataFrame()
@@ -118,22 +119,40 @@ def extract_features(kinematics_3d: np.ndarray, note_events: List, seq_id: str) 
     # wrist is index 0
     wrist_z_3d = kinematics_3d[:, 0, 2]
 
-    # --- 2. Project 3D -> 2D ---
+    # --- 2. Smooth 3D poses BEFORE projection (Important!) ---
+    try:
+        if num_frames >= 5:
+            # Apply Savitzky-Golay filter to 3D coordinates first
+            kinematics_3d = savgol_filter(kinematics_3d, window_length=5, polyorder=2, axis=0)
+            logger.debug(f"Applied smoothing to {num_frames} frames")
+    except Exception as e:
+        logger.debug(f"Smoothing skipped: {e}")
+
+    # --- 3. Project 3D -> 2D ---
     points_2d = project_3d_to_2d(kinematics_3d) # (Frames, 21, 2)
 
-    # --- 3. Smooth 2D points ---
+    # --- 4. Smooth 2D points again ---
     try:
         if num_frames >= 5:
             points_2d = savgol_filter(points_2d, window_length=5, polyorder=2, axis=0)
     except Exception:
         pass # Skip smoothing if too short
 
-    # --- 4. Calculate Derivatives (2D) ---
-    # Gradient returns list [grad_axis0, grad_axis1...], we want axis 0 (time)
+    # --- 5. Calculate Derivatives (2D) with outlier clipping ---
     vel_2d = np.gradient(points_2d, axis=0) / FRAME_DURATION
     acc_2d = np.gradient(vel_2d, axis=0) / FRAME_DURATION
+    
+    # Clip extreme velocities and accelerations (likely noise)
+    vel_clip_threshold = 10.0  # reasonable limit for hand movement
+    acc_clip_threshold = 50.0  # reasonable limit for acceleration
+    
+    vel_2d = np.clip(vel_2d, -vel_clip_threshold, vel_clip_threshold)
+    acc_2d = np.clip(acc_2d, -acc_clip_threshold, acc_clip_threshold)
+    
+    logger.debug(f"Velocity clipped to [{-vel_clip_threshold}, {vel_clip_threshold}]")
+    logger.debug(f"Acceleration clipped to [{-acc_clip_threshold}, {acc_clip_threshold}]")
 
-    # --- 5. Prepare Landmarks ---
+    # --- 6. Prepare Landmarks ---
     # Indices: Wrist=0, Index=8, Middle=12
     # Using 9 (Middle MCP) as Palm Center Proxy
     wrist_pos = points_2d[:, 0, :]
@@ -145,7 +164,7 @@ def extract_features(kinematics_3d: np.ndarray, note_events: List, seq_id: str) 
 
     all_rows = []
 
-    # --- 6. Labeling Logic ---
+    # --- 7. Labeling Logic ---
     labels = np.zeros((num_frames, 5), dtype=int)
 
     # Group notes by start time (Chord grouping)
@@ -209,7 +228,7 @@ def extract_features(kinematics_3d: np.ndarray, note_events: List, seq_id: str) 
                     labels[n_start:mid, f_real_idx] = 1
                     labels[mid:n_end, f_real_idx] = 3
 
-    # --- 7. Feature Construction ---
+    # --- 8. Feature Construction ---
     for f in range(num_frames):
         for i, (tip_idx, dip_idx) in enumerate(zip(fingertip_indices, dip_indices)):
             row = {}
@@ -224,65 +243,65 @@ def extract_features(kinematics_3d: np.ndarray, note_events: List, seq_id: str) 
             dip_p = points_2d[f, dip_idx]
 
             # 1. Position (Normalized)
-            row['finger_pos_x'] = tip_p[0]
-            row['finger_pos_y'] = tip_p[1]
-            row['wrist_pos_x'] = wrist_p[0]
-            row['wrist_pos_y'] = wrist_p[1]
+            row['finger_pos_x'] = float(tip_p[0])
+            row['finger_pos_y'] = float(tip_p[1])
+            row['wrist_pos_x'] = float(wrist_p[0])
+            row['wrist_pos_y'] = float(wrist_p[1])
 
-            # 2. Velocity (Normalized/sec)
-            row['finger_vel_x'] = tip_v[0]
-            row['finger_vel_y'] = tip_v[1]
-            row['finger_speed'] = np.linalg.norm(tip_v)
+            # 2. Velocity (Normalized/sec) - now clipped
+            row['finger_vel_x'] = float(tip_v[0])
+            row['finger_vel_y'] = float(tip_v[1])
+            row['finger_speed'] = float(np.linalg.norm(tip_v))
 
-            row['wrist_vel_x'] = wrist_v[0]
-            row['wrist_vel_y'] = wrist_v[1]
-            row['wrist_speed'] = np.linalg.norm(wrist_v)
+            row['wrist_vel_x'] = float(wrist_v[0])
+            row['wrist_vel_y'] = float(wrist_v[1])
+            row['wrist_speed'] = float(np.linalg.norm(wrist_v))
 
-            # 3. Acceleration
-            row['finger_acc_x'] = tip_a[0]
-            row['finger_acc_y'] = tip_a[1]
-            row['finger_acc_mag'] = np.linalg.norm(tip_a)
+            # 3. Acceleration - now clipped
+            row['finger_acc_x'] = float(tip_a[0])
+            row['finger_acc_y'] = float(tip_a[1])
+            row['finger_acc_mag'] = float(np.linalg.norm(tip_a))
 
             # 4. Relative (Tip - Wrist)
             rel_pos = tip_p - wrist_p
             rel_vel = tip_v - wrist_v
-            row['rel_finger_pos_x'] = rel_pos[0]
-            row['rel_finger_pos_y'] = rel_pos[1]
-            row['rel_finger_vel_x'] = rel_vel[0]
-            row['rel_finger_vel_y'] = rel_vel[1]
+            row['rel_finger_pos_x'] = float(rel_pos[0])
+            row['rel_finger_pos_y'] = float(rel_pos[1])
+            row['rel_finger_vel_x'] = float(rel_vel[0])
+            row['rel_finger_vel_y'] = float(rel_vel[1])
 
             # 5. Distances
-            row['dist_wrist'] = np.linalg.norm(rel_pos)
-            row['dist_palm'] = np.linalg.norm(tip_p - palm_p)
-            row['posture_dist'] = np.linalg.norm(tip_p - dip_p) # Tip to DIP
+            row['dist_wrist'] = float(np.linalg.norm(rel_pos))
+            row['dist_palm'] = float(np.linalg.norm(tip_p - palm_p))
+            row['posture_dist'] = float(np.linalg.norm(tip_p - dip_p)) # Tip to DIP
 
             # 6. Relative Depth (Feature Requirement)
             # tip.z - wrist.z (from raw 3D)
             tip_z_3d = kinematics_3d[f, tip_idx, 2]
-            row['rel_depth'] = tip_z_3d - wrist_z_3d[f]
+            row['rel_depth'] = float(tip_z_3d - wrist_z_3d[f])
 
             # 7. Rolling Averages (Last 5 frames)
             s_idx = max(0, f-4)
-            row['avg_speed'] = np.mean(np.linalg.norm(vel_2d[s_idx:f+1, tip_idx], axis=1))
-            row['avg_acc_mag'] = np.mean(np.linalg.norm(acc_2d[s_idx:f+1, tip_idx], axis=1))
+            row['avg_speed'] = float(np.mean(np.linalg.norm(vel_2d[s_idx:f+1, tip_idx], axis=1)))
+            row['avg_acc_mag'] = float(np.mean(np.linalg.norm(acc_2d[s_idx:f+1, tip_idx], axis=1)))
 
             # 8. Lags (Speed)
             for lag in [2, 4, 6]:
                 if f >= lag:
                     l_idx = f - lag
-                    row[f'lag_speed_{lag}'] = np.linalg.norm(vel_2d[l_idx, tip_idx])
+                    row[f'lag_speed_{lag}'] = float(np.linalg.norm(vel_2d[l_idx, tip_idx]))
                 else:
                     row[f'lag_speed_{lag}'] = 0.0
 
             # 9. Rolling Variance (Stability)
             if f > 4:
-                row['rolling_var_speed'] = np.var(np.linalg.norm(vel_2d[s_idx:f+1, tip_idx], axis=1))
+                row['rolling_var_speed'] = float(np.var(np.linalg.norm(vel_2d[s_idx:f+1, tip_idx], axis=1)))
             else:
                 row['rolling_var_speed'] = 0.0
 
             # Meta
             row['sequence_id'] = seq_id
-            row['ground_truth_label'] = labels[f, i]
+            row['ground_truth_label'] = int(labels[f, i])
 
             all_rows.append(row)
 
@@ -406,58 +425,108 @@ class SyncPianoMotionDataset:
         logger.info(f"Matched {len(sequences)} sequences.")
         return sorted(sequences, key=lambda x: x['sequence'])
 
-    def run(self, limit: int = 100000):
+    def run(self, max_sequences: int = None, limit: int = None, use_multiprocessing: bool = False):
         """
         Main execution method.
+        
+        Args:
+            max_sequences: Maximum number of sequences to process (None = process all)
+            limit: Maximum number of samples to extract (None = no limit)
+            use_multiprocessing: If False, runs sequentially for better debugging
         """
         sequences = self.scan_files()
         if not sequences:
             logger.warning("No sequences found. Please check dataset path.")
             return
 
+        # Limit number of sequences
+        if max_sequences is not None:
+            sequences = sequences[:max_sequences]
+            logger.info(f"Processing first {len(sequences)} sequences")
+
         all_dfs = []
         total_samples = 0
 
-        # Multiprocessing
-        max_workers = os.cpu_count() or 1
-        logger.info(f"Starting processing with {max_workers} workers...")
+        logger.info(f"Max sequences: {max_sequences if max_sequences else 'All'}")
+        logger.info(f"Sample limit: {limit if limit else 'No limit'}")
+        logger.info(f"Processing mode: {'Multiprocessing' if use_multiprocessing else 'Sequential (for accuracy)'}")
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            # Using list() to trigger iteration immediately if needed, but map is lazy
-            # We use map to keep order usually, but as_completed is better for progress bar
-            from concurrent.futures import as_completed
-            future_to_seq = {executor.submit(process_sequence_file, seq): seq for seq in sequences}
+        if use_multiprocessing:
+            # Multiprocessing mode
+            max_workers = os.cpu_count() or 1
+            logger.info(f"Starting processing with {max_workers} workers...")
 
-            for future in tqdm(as_completed(future_to_seq), total=len(sequences), desc="Processing Sequences"):
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                from concurrent.futures import as_completed
+                future_to_seq = {executor.submit(process_sequence_file, seq): seq for seq in sequences}
+
+                for future in tqdm(as_completed(future_to_seq), total=len(sequences), desc="Processing Sequences"):
+                    try:
+                        df = future.result()
+                        if not df.empty:
+                            all_dfs.append(df)
+                            total_samples += len(df)
+
+                            if limit is not None and total_samples >= limit:
+                                logger.info(f"Sample limit reached: {total_samples} samples.")
+                                break
+                    except Exception as e:
+                        logger.error(f"Worker error: {e}")
+        else:
+            # Sequential mode - for debugging and accuracy
+            logger.info("Starting sequential processing...")
+            
+            for idx, seq_meta in enumerate(tqdm(sequences, desc="Processing Sequences"), 1):
                 try:
-                    df = future.result()
+                    df = process_sequence_file(seq_meta)
                     if not df.empty:
                         all_dfs.append(df)
                         total_samples += len(df)
-
-                        if total_samples >= limit:
-                            logger.info(f"Limit reached: {total_samples} samples.")
-                            # Cancel remaining? ProcessPoolExecutor doesn't support easy cancel of running
-                            # But we can break loop and stop submitting if we were submitting in chunks
-                            # Here we submitted all. We just break gathering.
+                        
+                        # Periodic logging
+                        if idx % 10 == 0:
+                            logger.info(f"Processed {idx}/{len(sequences)} sequences - {total_samples} samples extracted")
+                        
+                        if limit is not None and total_samples >= limit:
+                            logger.info(f"Sample limit reached: {total_samples} samples.")
                             break
+                    else:
+                        logger.debug(f"No features extracted from {seq_meta['sequence']}")
+                        
                 except Exception as e:
-                    logger.error(f"Worker error: {e}")
+                    logger.error(f"Error processing {seq_meta['sequence']}: {e}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
+                    continue
 
         if all_dfs:
             final_df = pd.concat(all_dfs, ignore_index=True)
 
             # Enforce limit exactly if needed (optional, but good)
-            if len(final_df) > limit:
+            if limit is not None and len(final_df) > limit:
                 final_df = final_df.iloc[:limit]
 
             out_path = self.output_dir / "features.csv"
             final_df.to_csv(out_path, index=False)
-            logger.info(f"Saved {len(final_df)} samples to {out_path}")
+            logger.info(f"\n✅ Saved {len(final_df)} samples to {out_path}")
+            logger.info(f"   Feature columns: {len(final_df.columns)}")
+            logger.info(f"   Features: {list(final_df.columns[:10])}{'...' if len(final_df.columns) > 10 else ''}")
+            logger.info(f"   Label distribution:\n{final_df['ground_truth_label'].value_counts().to_dict()}")
+            
+            # Data validation
+            logger.info(f"\n📊 Data Quality Check:")
+            logger.info(f"   Non-null values: {final_df.isnull().sum().sum()} nulls in {len(final_df) * len(final_df.columns)} total values")
+            
+            # Check for extreme values
+            numeric_cols = final_df.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols[:5]:  # Check first 5 numeric columns
+                max_val = final_df[col].abs().max()
+                min_val = final_df[col].min()
+                if max_val > 1e6:
+                    logger.warning(f"   ⚠️  {col}: extreme values detected (max abs: {max_val:.2e})")
         else:
             logger.warning("No features extracted.")
 
 if __name__ == "__main__":
     engine = SyncPianoMotionDataset()
-    engine.run(limit=100000)
+    engine.run(max_sequences=20, use_multiprocessing=False)  # Sequential processing for accuracy
