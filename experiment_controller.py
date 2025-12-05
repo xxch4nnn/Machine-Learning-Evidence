@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 DATA_DIR = repo_root / "Machine_Learning_Course" / "Data" / "PianoMotion10M"
-FEATURES_CSV = DATA_DIR / "features.csv"
+FEATURES_CSV = DATA_DIR / "features_real_pianomotion10m.csv"
 RESULTS_DIR = DATA_DIR / "experiments"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -101,7 +101,7 @@ def main():
     # For speed in verification, we use full_df. In production, this is correct.
 
     # Initialize pipeline just for RFE
-    rfe_pipeline = PianoMotionMLPipeline(dataframe=full_df)
+    rfe_pipeline = PianoMotionMLPipeline(features_csv=str(FEATURES_CSV), dataframe=full_df)
     X_train, _, y_train, _ = rfe_pipeline.load_and_prepare_data()
 
     # Perform RFE
@@ -131,7 +131,8 @@ def main():
         df_slice = full_df[full_df['sequence_id'].isin(target_seqs)]
 
         # Initialize Pipeline
-        pipeline = PianoMotionMLPipeline(dataframe=df_slice, random_state=42)
+        # We pass FEATURES_CSV so models are saved in the correct directory relative to data
+        pipeline = PianoMotionMLPipeline(features_csv=str(FEATURES_CSV), dataframe=df_slice, random_state=42)
 
         # Run Pipeline (Skip SVM for speed, Use Pre-selected Features)
         # We allow tuning here to find best params
@@ -185,7 +186,7 @@ def main():
         df_slice = full_df[full_df['sequence_id'].isin(target_seqs)]
 
         # Pipeline
-        pipeline = PianoMotionMLPipeline(dataframe=df_slice, random_state=42)
+        pipeline = PianoMotionMLPipeline(features_csv=str(FEATURES_CSV), dataframe=df_slice, random_state=42)
 
         # Run with FIXED params
         output_path = pipeline.run_pipeline(
