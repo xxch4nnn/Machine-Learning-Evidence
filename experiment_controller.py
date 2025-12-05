@@ -1,23 +1,21 @@
 """
 experiment_controller.py
-Controller script for running Incremental Learning experiments on Cloud Kernels (Colab/Kaggle).
-Implements "Generate Once, Slice Many" strategy.
+Resumable Incremental Learning Controller for PianoMotion10M.
+Implements "Generate Once, Slice Many" strategy with Robust State Management.
 """
 
-# --- 1. Universal Header ---
 import os
 import sys
-import numpy as np
-import pandas as pd
+import json
 import logging
+import shutil
+import pandas as pd
+import numpy as np
+import joblib
 from pathlib import Path
-import matplotlib.pyplot as plt
-import seaborn as sns
-from collections import Counter
+from typing import Dict, List, Optional
 
-# Add repo root to path so we can import modules
-# Assuming this script is running in a Colab cell or from repo root
-# Adjust repo_root based on where the file is. If it's in root:
+# Add repo root to path
 repo_root = Path(__file__).parent.resolve()
 sys.path.append(str(repo_root))
 
@@ -30,220 +28,296 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 DATA_DIR = repo_root / "Machine_Learning_Course" / "Data" / "PianoMotion10M"
-FEATURES_CSV = DATA_DIR / "features_real_pianomotion10m.csv"
-RESULTS_DIR = DATA_DIR / "experiments"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+EXPERIMENT_DIR = DATA_DIR / "experiments_incremental"
+STATE_FILE = EXPERIMENT_DIR / "state.json"
+MASTER_FEATURES_CSV = EXPERIMENT_DIR / "features_accumulated.csv"
+RESULTS_CSV = EXPERIMENT_DIR / "incremental_results.csv"
 
-# Verification Mode: Uses small dummy dataset if True
-VERIFICATION_MODE = False
+MAX_SAMPLES = 100000
 
-def create_dummy_verification_data():
-    """Duplicates sample data to simulate multiple sequences for verification."""
-    logger.info("🛠️ Creating dummy data for VERIFICATION_MODE...")
+class CheckpointManager:
+    """
+    Manages the state of the experiment to allow resumption after crashes.
+    """
+    def __init__(self, state_file: Path):
+        self.state_file = state_file
+        self.experiment_dir = state_file.parent
+        self.experiment_dir.mkdir(parents=True, exist_ok=True)
 
-    # Locate sample JSON in Data Pipeline folder
-    pipeline_dir = repo_root / "Machine_Learning_Course" / "Code" / "Data_Pipeline"
-    sample_json = pipeline_dir / "BV1Jf421Z732_seq_0000.json"
+    def load_state(self) -> Dict:
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                logger.info(f"🔄 Loaded state: Phase {state.get('phase', 'INIT')}, {len(state.get('processed_sequences', []))} sequences processed.")
+                return state
+            except Exception as e:
+                logger.error(f"❌ Corrupt state file: {e}")
 
-    if not sample_json.exists():
-        logger.error(f"Sample file not found at {sample_json}")
-        return
+        # Default State
+        return {
+            "phase": "A", # A = Tuning, B = Scaling, DONE = Finished
+            "processed_sequences": [], # List of sequence IDs completed
+            "best_params": None,
+            "results_history": [],
+            "sample_count": 0
+        }
 
-    # Create 15 dummy copies
-    for i in range(1, 16):
-        dummy_path = pipeline_dir / f"dummy_seq_{i:02d}.json"
-        with open(sample_json, 'rb') as src, open(dummy_path, 'wb') as dst:
-            dst.write(src.read())
+    def save_state(self, state: Dict):
+        # Atomic save
+        temp_file = self.state_file.with_suffix('.tmp')
+        with open(temp_file, 'w') as f:
+            json.dump(state, f, indent=4)
+        shutil.move(temp_file, self.state_file)
+        logger.info("💾 State saved.")
 
-    # Run Sync to generate features.csv with these new files
-    # We point Sync to the pipeline dir where dummies are
-    logger.info("Running SyncPianoMotionDataset on dummy files...")
-    processor = SyncPianoMotionDataset(dataset_dir=pipeline_dir)
-    processor.run(max_files=None, output_csv="features.csv")
+class ExperimentController:
+    """
+    Orchestrates the Incremental Learning Experiment.
+    """
+    def __init__(self):
+        self.checkpoint_manager = CheckpointManager(STATE_FILE)
+        self.state = self.checkpoint_manager.load_state()
+        self.dataset_engine = SyncPianoMotionDataset()
 
-    # Move/Copy features.csv to expected DATA_DIR location if needed
-    # Sync script now saves to Machine_Learning_Course/Data/PianoMotion10M/features.csv by default relative to repo
-    # So it should be in the right place.
+        # Load accumulated data if exists
+        if MASTER_FEATURES_CSV.exists():
+            self.cumulative_df = pd.read_csv(MASTER_FEATURES_CSV)
+            logger.info(f"📚 Loaded accumulated dataset: {len(self.cumulative_df)} samples.")
+        else:
+            self.cumulative_df = pd.DataFrame()
 
-    logger.info("✅ Dummy data generation complete.")
+    def get_remaining_sequences(self) -> List[Dict]:
+        """
+        Returns list of sequence metadata that have NOT been processed yet.
+        """
+        all_sequences = self.dataset_engine.parser.list_sequences()
+        processed_set = set(self.state['processed_sequences'])
 
-def main():
-    logger.info("\n" + "="*60)
-    logger.info("🧪 PIANOMOTION EXPERIMENT CONTROLLER")
-    logger.info("="*60)
+        remaining = [s for s in all_sequences if s['sequence'] not in processed_set]
+        return remaining
 
-    if VERIFICATION_MODE:
-        create_dummy_verification_data()
+    def run_phase_a_tuning(self):
+        """
+        Phase A: Process first 10 files (1 by 1).
+        Run GridSearch on accumulated data to find best params.
+        """
+        logger.info("\n" + "="*60)
+        logger.info("🔬 PHASE A: Tuning (Files 1-10)")
+        logger.info("="*60)
 
-    # --- 2. Data Strategy: Load Once ---
-    if not FEATURES_CSV.exists():
-        logger.error(f"Features file not found: {FEATURES_CSV}")
-        logger.info("Please run SyncPianoMotionDataset.py first.")
-        return
+        target_count = 10
+        current_processed_count = len(self.state['processed_sequences'])
 
-    logger.info(f"Loading full dataset from {FEATURES_CSV}...")
-    full_df = pd.read_csv(FEATURES_CSV)
+        if current_processed_count >= target_count:
+            logger.info("✅ Phase A already complete.")
+            if self.state['phase'] == 'A':
+                self.state['phase'] = 'B'
+                self.checkpoint_manager.save_state(self.state)
+            return
 
-    if 'sequence_id' not in full_df.columns:
-        logger.error("❌ 'sequence_id' column missing. Please update SyncPianoMotionDataset.py.")
-        return
+        # We need to process up to 10 files
+        # We fetch them one by one
+        remaining = self.get_remaining_sequences()
 
-    unique_sequences = full_df['sequence_id'].unique()
-    n_sequences = len(unique_sequences)
-    logger.info(f"Loaded {len(full_df)} samples from {n_sequences} sequences.")
+        # Limit to needed amount for Phase A
+        needed = target_count - current_processed_count
+        to_process = remaining[:needed]
 
-    # --- 3. Feature Selection (One-Time) ---
-    logger.info("\n" + "-"*60)
-    logger.info("🔍 PHASE 0: Global Feature Selection")
-    logger.info("-" * 60)
+        # We manually iterate because yield_batch fetches dynamically
+        # But here we want specific control.
+        # Actually, let's use a helper that re-uses yield_batch logic but for specific list
 
-    # We run RFE once on the full dataset (or a large representative subset)
-    # For speed in verification, we use full_df. In production, this is correct.
+        batch_gen = self._manual_batch_generator(to_process, batch_size=1)
 
-    # Initialize pipeline just for RFE
-    rfe_pipeline = PianoMotionMLPipeline(features_csv=str(FEATURES_CSV), dataframe=full_df)
-    X_train, _, y_train, _ = rfe_pipeline.load_and_prepare_data()
+        best_params_history = []
 
-    # Perform RFE
-    selected_features = rfe_pipeline.perform_rfe(X_train, y_train)
-    selected_features_list = list(selected_features)
+        for batch_df in batch_gen:
+            if batch_df.empty: continue
 
-    logger.info(f"✅ Locked {len(selected_features_list)} features for all experiments.")
+            # Accumulate
+            self.cumulative_df = pd.concat([self.cumulative_df, batch_df], ignore_index=True)
+            self.cumulative_df.to_csv(MASTER_FEATURES_CSV, index=False)
 
-    # --- 4. Experiment Workflow ---
+            # Update state variables (locally)
+            new_seqs = batch_df['sequence_id'].unique().tolist()
+            self.state['processed_sequences'].extend(new_seqs)
+            self.state['sample_count'] = len(self.cumulative_df)
 
-    # Step A: Hyperparameter Exploration (1-10 Files)
-    logger.info("\n" + "="*60)
-    logger.info("🔬 STEP A: Hyperparameter Exploration (1-10 Files)")
-    logger.info("="*60)
+            logger.info(f"--- Training Step A (Seqs: {len(self.state['processed_sequences'])}) ---")
 
-    best_params_history = []
-    step_a_results = []
+            # Run Pipeline with Tuning
+            pipeline = PianoMotionMLPipeline(dataframe=self.cumulative_df)
+            pipeline.load_and_prepare_data()
 
-    # Determine loop range (up to 10, or less if we have fewer sequences)
-    max_a = min(10, n_sequences)
+            # Select features (RFE once or every time? Plan implies every time for tuning, or fixed?
+            # Controller says: "Run GridSearchCV... Save best params")
+            # We'll run full pipeline.
+            output_dir = EXPERIMENT_DIR / f"step_a_{len(self.state['processed_sequences'])}"
+            pipeline.run_pipeline(output_dir=output_dir, skip_svm=True)
 
-    for n in range(1, max_a + 1):
-        logger.info(f"\n--- Experiment A.{n}: Training on {n} Sequence(s) ---")
+            # Capture Params
+            rf_model = pipeline.models['Random Forest']
+            best_params = rf_model.get_params()
+            relevant_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features']
+            filtered_params = {k: best_params[k] for k in relevant_keys}
 
-        # Slice DataFrame
-        target_seqs = unique_sequences[:n]
-        df_slice = full_df[full_df['sequence_id'].isin(target_seqs)]
+            self.state['best_params'] = filtered_params
 
-        # Initialize Pipeline
-        # We pass FEATURES_CSV so models are saved in the correct directory relative to data
-        pipeline = PianoMotionMLPipeline(features_csv=str(FEATURES_CSV), dataframe=df_slice, random_state=42)
+            # Save State
+            self.checkpoint_manager.save_state(self.state)
 
-        # Run Pipeline (Skip SVM for speed, Use Pre-selected Features)
-        # We allow tuning here to find best params
-        output_path = pipeline.run_pipeline(
-            output_dir=RESULTS_DIR / f"step_a_{n}",
-            selected_features=selected_features_list,
-            skip_svm=True
-        )
+        # Transition to Phase B
+        self.state['phase'] = 'B'
+        self.checkpoint_manager.save_state(self.state)
+        logger.info("✅ Phase A Complete. Transitioning to Phase B.")
 
-        # Log Best Params
-        rf_model = pipeline.models['Random Forest']
-        best_params = rf_model.get_params()
-        # Filter for relevant keys
-        relevant_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features']
-        filtered_params = {k: best_params[k] for k in relevant_keys}
+    def run_phase_b_scaling(self):
+        """
+        Phase B: Process remaining files in batches of 5.
+        Stop when total samples > 100k.
+        Use Fixed Best Params from Phase A.
+        """
+        logger.info("\n" + "="*60)
+        logger.info("📈 PHASE B: Scaling (Batch Size 5)")
+        logger.info("="*60)
 
-        best_params_history.append(filtered_params)
+        if self.state['sample_count'] >= MAX_SAMPLES:
+            logger.info("🛑 Sample limit reached. Experiment complete.")
+            self.state['phase'] = 'DONE'
+            self.checkpoint_manager.save_state(self.state)
+            return
 
-        # Store score
-        score = pipeline.results['Random Forest']['f1_score']
-        step_a_results.append({'n_sequences': n, 'f1_score': score, 'params': filtered_params})
-        logger.info(f"Result A.{n}: F1={score:.4f}")
+        remaining = self.get_remaining_sequences()
+        if not remaining:
+            logger.info("✅ All available files processed.")
+            self.state['phase'] = 'DONE'
+            self.checkpoint_manager.save_state(self.state)
+            return
 
-    # Select Optimal Hyperparameters (Simple approach: Majority vote or parameters from best run)
-    # Let's pick the params from the run with the best F1 score on the largest subset (A.10)
-    # OR find the most common config. For simplicity/stability, using the config from the largest sample in Step A is robust.
-    optimal_params = best_params_history[-1]
-    logger.info(f"\n🏆 Optimal Hyperparameters Selected (from n={max_a}): {optimal_params}")
+        batch_gen = self._manual_batch_generator(remaining, batch_size=5)
 
-    # Step B: Incremental Learning Curve (1..All Files)
-    logger.info("\n" + "="*60)
-    logger.info("📈 STEP B: Incremental Learning Curve")
-    logger.info("="*60)
+        fixed_params = self.state.get('best_params')
+        if not fixed_params:
+            logger.warning("⚠️ No best params found from Phase A. Using defaults.")
+            fixed_params = {}
 
-    step_b_results = []
+        for batch_df in batch_gen:
+            # Accumulate
+            self.cumulative_df = pd.concat([self.cumulative_df, batch_df], ignore_index=True)
+            self.cumulative_df.to_csv(MASTER_FEATURES_CSV, index=False)
 
-    # Step size for loop
-    step_size = 5 if n_sequences > 20 else 1
+            # Update State
+            new_seqs = batch_df['sequence_id'].unique().tolist()
+            self.state['processed_sequences'].extend(new_seqs)
+            self.state['sample_count'] = len(self.cumulative_df)
 
-    # Range: 1 to Total, stepping by 5
-    # Ensure we hit the max
-    x_values = list(range(1, n_sequences + 1, step_size))
-    if x_values[-1] != n_sequences:
-        x_values.append(n_sequences)
+            n_seqs = len(self.state['processed_sequences'])
+            logger.info(f"\n--- Training Step B (Seqs: {n_seqs}, Samples: {self.state['sample_count']}) ---")
 
-    for n in x_values:
-        logger.info(f"\n--- Experiment B.{n}: Training on {n} Sequence(s) (Fixed Params) ---")
+            # Run Pipeline (Fixed Params)
+            pipeline = PianoMotionMLPipeline(dataframe=self.cumulative_df)
+            # Use cached selected features if available to speed up?
+            # ML Pipeline loads from file if passed.
+            # We'll just let it run. RFE might be slow on large data.
+            # Optimization: Load selected features from Phase A if possible.
+            # We will rely on ML Pipeline's RFE (it's fast enough for <100k samples usually, or we could pass list)
 
-        # Slice
-        target_seqs = unique_sequences[:n]
-        df_slice = full_df[full_df['sequence_id'].isin(target_seqs)]
+            output_dir = EXPERIMENT_DIR / f"step_b_{n_seqs}"
+            pipeline.run_pipeline(output_dir=output_dir, fixed_rf_params=fixed_params, skip_svm=True)
 
-        # Pipeline
-        pipeline = PianoMotionMLPipeline(features_csv=str(FEATURES_CSV), dataframe=df_slice, random_state=42)
+            # Log Metrics
+            metrics = pipeline.results['Random Forest']
+            result_row = {
+                'phase': 'B',
+                'n_sequences': n_seqs,
+                'n_samples': self.state['sample_count'],
+                'f1_score': metrics['f1_score'],
+                'precision': metrics['precision'],
+                'recall': metrics['recall'],
+                'fps': metrics['fps']
+            }
+            self.state['results_history'].append(result_row)
 
-        # Run with FIXED params
-        output_path = pipeline.run_pipeline(
-            output_dir=RESULTS_DIR / f"step_b_{n}",
-            selected_features=selected_features_list,
-            fixed_rf_params=optimal_params, # Force fixed params
-            skip_svm=True
-        )
+            # Append to CSV
+            results_df = pd.DataFrame([result_row])
+            write_header = not RESULTS_CSV.exists()
+            results_df.to_csv(RESULTS_CSV, mode='a', header=write_header, index=False)
 
-        # Log Metrics
-        metrics = pipeline.results['Random Forest']
-        step_b_results.append({
-            'n_sequences': n,
-            'n_samples': len(df_slice),
-            'f1_score': metrics['f1_score'],
-            'precision': metrics['precision'],
-            'recall': metrics['recall']
-        })
+            # Save State
+            self.checkpoint_manager.save_state(self.state)
 
-    # --- 5. Final Reporting & Visualization ---
-    logger.info("\n" + "="*60)
-    logger.info("📊 FINAL REPORT")
-    logger.info("="*60)
+            # Check Stop Condition
+            if self.state['sample_count'] >= MAX_SAMPLES:
+                logger.info(f"🛑 limit reached ({self.state['sample_count']} >= {MAX_SAMPLES}). Stopping.")
+                self.state['phase'] = 'DONE'
+                self.checkpoint_manager.save_state(self.state)
+                break
 
-    results_df = pd.DataFrame(step_b_results)
-    print(results_df)
+    def _manual_batch_generator(self, sequence_list: List[Dict], batch_size: int):
+        """
+        Helper to yield batches from a specific list of sequence metadata.
+        Uses the Dataset Engine's internal logic logic but bypasses its own list_sequences().
+        """
+        current_batch = []
 
-    results_csv = RESULTS_DIR / "incremental_learning_results.csv"
-    results_df.to_csv(results_csv, index=False)
-    logger.info(f"Results saved to {results_csv}")
+        for seq_meta in sequence_list:
+            try:
+                # Reuse logic by temporarily pointing dataset to file?
+                # Or just duplicate the loading logic here?
+                # Better: call a method on engine.
+                # I'll expose a `process_single_sequence` method in engine or just replicate code?
+                # The engine code is in SyncPianoMotionDataset.
+                # I can modify SyncPianoMotionDataset to accept a list of sequences to process,
+                # OR just manually load here using the engine's methods.
+                # But `load_midi_labels` and `extract_features` are methods.
 
-    # Plot Learning Curve
-    plt.figure(figsize=(10, 6))
-    plt.plot(results_df['n_sequences'], results_df['f1_score'], marker='o', label='F1-Score')
-    plt.plot(results_df['n_sequences'], results_df['precision'], marker='s', linestyle='--', label='Precision')
-    plt.plot(results_df['n_sequences'], results_df['recall'], marker='^', linestyle='--', label='Recall')
+                # Let's read the file manually and call `extract_features`
+                with open(seq_meta['pose_path'], 'r') as f:
+                    raw = json.load(f)
+                    if 'right' in raw: data = raw['right']
+                    elif 'left' in raw: data = raw['left']
+                    elif isinstance(raw, list): data = raw
+                    else: continue
 
-    plt.title('Incremental Learning Curve - Piano Motion Classification')
-    plt.xlabel('Number of Sequences')
-    plt.ylabel('Score (Weighted)')
-    plt.legend()
-    plt.grid(True)
+                frames = []
+                for fr in data:
+                    if len(fr) == 63: frames.append(np.array(fr).reshape(21, 3))
+                    elif len(fr) == 62: frames.append(np.array(fr + [0]).reshape(21, 3))
 
-    plot_path = RESULTS_DIR / "learning_curve.png"
-    plt.savefig(plot_path)
-    logger.info(f"Learning curve saved to {plot_path}")
+                points_3d = np.array(frames)
+                note_events = self.dataset_engine.load_midi_labels(seq_meta['midi_path'])
 
-    logger.info("\n✅ Experiment Controller Finished Successfully.")
+                df = self.dataset_engine.extract_features(points_3d, note_events, seq_meta['sequence'])
+
+                if not df.empty:
+                    current_batch.append(df)
+
+            except Exception as e:
+                logger.warning(f"Failed to process {seq_meta['sequence']}: {e}")
+
+            if len(current_batch) >= batch_size:
+                yield pd.concat(current_batch, ignore_index=True)
+                current_batch = []
+
+        if current_batch:
+            yield pd.concat(current_batch, ignore_index=True)
+
+    def run(self):
+        logger.info("🚀 Starting Experiment Controller")
+
+        if self.state['phase'] == 'DONE':
+            logger.info("✅ Experiment marked as DONE. Delete state.json to restart.")
+            return
+
+        if self.state['phase'] == 'A':
+            self.run_phase_a_tuning()
+
+        if self.state['phase'] == 'B':
+            self.run_phase_b_scaling()
+
+        logger.info("🏁 Controller Finished.")
 
 if __name__ == "__main__":
-    # Check for CLI args to enable verification mode
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--verify', action='store_true', help='Run in verification mode with dummy data')
-    args = parser.parse_args()
-
-    if args.verify:
-        VERIFICATION_MODE = True
-
-    main()
+    controller = ExperimentController()
+    controller.run()

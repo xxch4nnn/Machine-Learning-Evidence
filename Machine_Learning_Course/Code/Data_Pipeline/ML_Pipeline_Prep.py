@@ -97,16 +97,31 @@ class PianoMotionMLPipeline:
             raise ValueError(f"Label column '{label_col}' not found in CSV")
         
         # Explicitly define feature columns
+        # UPDATED: Now uses 2D projected features + derived metrics
         feature_cols = [
-            'finger_velocity_x', 'finger_velocity_y', 'finger_velocity_z',
-            'finger_acceleration_x', 'finger_acceleration_y', 'finger_acceleration_z',
-            'finger_position_x', 'finger_position_y', 'finger_position_z',
-            'depth_feature', 'posture_feature', 'euclidean_distance',
-            'distance_from_wrist', 'fingertip_to_palm_center_distance',
-            'wrist_velocity_x', 'wrist_velocity_y', 'wrist_velocity_z',
-            'relative_velocity_x', 'relative_velocity_y', 'relative_velocity_z',
-            'avg_velocity_x', 'avg_velocity_y', 'avg_velocity_z',
-            'avg_acceleration_x', 'avg_acceleration_y', 'avg_acceleration_z'
+            # 1. Position (Normalized 2D)
+            'finger_pos_x', 'finger_pos_y',
+            'wrist_pos_x', 'wrist_pos_y',
+
+            # 2. Velocity
+            'finger_vel_x', 'finger_vel_y', 'finger_speed',
+            'wrist_vel_x', 'wrist_vel_y', 'wrist_speed',
+
+            # 3. Acceleration
+            'finger_acc_x', 'finger_acc_y', 'finger_acc_mag',
+
+            # 4. Relative
+            'rel_finger_pos_x', 'rel_finger_pos_y',
+            'rel_finger_vel_x', 'rel_finger_vel_y',
+
+            # 5. Distances
+            'dist_wrist', 'dist_palm', 'posture_dist',
+
+            # 6. Relative Depth (Z-proxy)
+            'rel_depth',
+
+            # 7. Averages
+            'avg_speed', 'avg_acc_mag'
         ]
 
         # Add lag features if present in CSV but not in list

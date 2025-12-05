@@ -1,494 +1,500 @@
 """
 SyncPianoMotionDataset.py
-Synchronizes 3D hand kinematics from JSON files with MIDI keypress data.
-Extracts features for all five fingers of the right hand and labels key presses
-based on a heuristic that identifies the finger with the highest downward velocity
-at the time of a MIDI note_on event.
+The Unified Data Engine for PianoMotion10M.
+Handles Downloading, Parsing, 3D-to-2D Projection, Feature Extraction, and Batch Generation.
 """
 
+import os
+import sys
+import json
+import zipfile
+import urllib.request
 import numpy as np
 import pandas as pd
-from pathlib import Path
-import json
 import logging
+import joblib
+from pathlib import Path
 from tqdm import tqdm
 import mido
-from collections import defaultdict
+from scipy.signal import savgol_filter
+from concurrent.futures import ProcessPoolExecutor
+from typing import Dict, List, Optional, Tuple, Generator
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- 1. Downloader & Parser Logic (Merged from DownloadRealPianoMotion10M.py) ---
+
+class PianoMotion10MDownloader:
+    """
+    Downloads and manages the PianoMotion10M dataset.
+    """
+    GITHUB_ZIP = "https://zenodo.org/records/13297386/files/annotation.zip?download=1"
+    MIDI_ZIP_URL = "https://zenodo.org/records/13297386/files/midi.zip?download=1"
+
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.data_dir = self.output_dir / "data"
+
+    def download(self) -> bool:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check if data exists
+        if self.data_dir.exists() and any(self.data_dir.iterdir()):
+            logger.info("✅ Dataset directory exists. Skipping download.")
+            return True
+
+        zip_files = {
+            "annotation.zip": self.GITHUB_ZIP,
+            "midi.zip": self.MIDI_ZIP_URL,
+        }
+
+        try:
+            for zip_name, url in zip_files.items():
+                zip_path = self.output_dir / zip_name
+                if not zip_path.exists():
+                    logger.info(f"Downloading {zip_name} from {url}...")
+                    urllib.request.urlretrieve(url, zip_path)
+
+                logger.info(f"Extracting {zip_name}...")
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(self.output_dir)
+
+                zip_path.unlink() # Cleanup
+            return True
+        except Exception as e:
+            logger.error(f"❌ Download failed: {e}")
+            return False
+
+class PianoMotion10MParser:
+    """
+    Parses the dataset directory structure.
+    """
+    def __init__(self, dataset_dir: Path):
+        self.dataset_dir = dataset_dir
+        self.data_dir = dataset_dir / "data"
+
+    def list_sequences(self) -> List[Dict]:
+        """
+        Scans the data directory and returns a list of all available sequence metadata.
+        Returns: List of dicts {'subject': str, 'sequence': str, 'paths': {...}}
+        """
+        sequences = []
+        if not self.data_dir.exists():
+            return sequences
+
+        # Walk through subjects
+        for subject_dir in self.data_dir.iterdir():
+            if not subject_dir.is_dir() or subject_dir.name == 'midi':
+                continue
+
+            # Handle nested structure (e.g., audio-002/audio/seq_id)
+            search_roots = [subject_dir]
+            if (subject_dir / 'audio').exists():
+                search_roots.append(subject_dir / 'audio')
+
+            for root in search_roots:
+                for seq_dir in root.iterdir():
+                    if seq_dir.is_dir():
+                        # Validate it has pose data
+                        pose_files = list(seq_dir.glob("*.json")) + list(seq_dir.glob("*.npz"))
+                        if not pose_files:
+                            continue
+
+                        # Find matching MIDI
+                        # MIDI is often in data/midi/midi/{seq_id}/*.mid
+                        midi_dir = self.data_dir / 'midi' / 'midi' / seq_dir.name
+                        midi_files = list(midi_dir.glob("*.mid"))
+
+                        # Fallback to local
+                        if not midi_files:
+                            midi_files = list(seq_dir.glob("*.mid"))
+
+                        if pose_files and midi_files:
+                            sequences.append({
+                                'subject': subject_dir.name,
+                                'sequence': seq_dir.name,
+                                'pose_path': pose_files[0],
+                                'midi_path': midi_files[0],
+                                'annotation_path': list(seq_dir.glob("*annotation*.json"))[0] if list(seq_dir.glob("*annotation*.json")) else None
+                            })
+
+        return sorted(sequences, key=lambda x: x['sequence'])
+
+
+# --- 2. The Main Data Engine Class ---
 
 class SyncPianoMotionDataset:
     """
-    Processes the PianoMotion10M dataset to create a synchronized feature set for
-    machine learning.
+    Unified Data Engine.
+    1. Downloads/Parses Data.
+    2. Projects 3D -> 2D using Camera Intrinsics.
+    3. Extracts 2D Physics Features.
+    4. Yields Batches for Incremental Learning.
     """
-    def __init__(self, dataset_dir: str, fps: float = 30.0):
-        """
-        Initializes the data processor.
 
-        Args:
-            dataset_dir: Path to the PianoMotion10M dataset directory.
-            fps: Frames per second of the motion capture data.
-        """
-        self.dataset_dir = Path(dataset_dir)
+    # Camera Intrinsics (Hardcoded Defaults)
+    CAM_W = 1920
+    CAM_H = 1080
+    FX = 1000
+    FY = 1000
+    CX = 960
+    CY = 540
+
+    def __init__(self, dataset_dir: str = None, fps: float = 30.0):
+        if dataset_dir is None:
+             # Default to repo structure
+             self.dataset_dir = Path(__file__).parent.parent.parent / "Data" / "PianoMotion10M"
+        else:
+            self.dataset_dir = Path(dataset_dir)
+
         self.fps = fps
         self.frame_duration = 1.0 / fps
 
-    def load_midi_labels(self, midi_file: Path) -> dict:
+        # Initialize sub-components
+        self.downloader = PianoMotion10MDownloader(self.dataset_dir)
+        self.parser = PianoMotion10MParser(self.dataset_dir)
+
+    def project_3d_to_2d(self, points_3d: np.ndarray) -> np.ndarray:
         """
-        Loads a MIDI file and extracts note press events with their start and end frames.
+        Projects 3D points (x, y, z) to Normalized 2D screen coordinates (u_norm, v_norm).
+        Uses pinhole camera model.
 
         Args:
-            midi_file: Path to the MIDI file.
+            points_3d: (N, 21, 3) array of 3D coordinates.
 
         Returns:
-            A dictionary where keys are note numbers and values are lists of
-            (start_frame, end_frame) tuples.
+            (N, 21, 2) array of normalized 2D coordinates [0, 1].
         """
-        note_events = {}
-        try:
-            midi = mido.MidiFile(str(midi_file))
-            ticks_per_beat = midi.ticks_per_beat or 480
-            tempo = 500000  # Default tempo (120 BPM)
+        # Unpack
+        x = points_3d[..., 0]
+        y = points_3d[..., 1]
+        z = points_3d[..., 2]
 
-            # Find the first tempo change event
-            for msg in mido.merge_tracks(midi.tracks):
+        # Avoid division by zero
+        z = np.where(z == 0, 1e-6, z)
+
+        # Pinhole Projection
+        u = (x / z) * self.FX + self.CX
+        v = (y / z) * self.FY + self.CY
+
+        # Normalize
+        u_norm = u / self.CAM_W
+        v_norm = v / self.CAM_H
+
+        return np.stack([u_norm, v_norm], axis=-1)
+
+    def load_midi_labels(self, midi_file: Path) -> Dict[int, int]:
+        """
+        Parses MIDI to get per-frame binary labels (Pressed=1, Hover/Release=0).
+        Logic adapted to match 'Press' state priority.
+        """
+        frame_labels = {}
+        try:
+            mid = mido.MidiFile(str(midi_file))
+            tempo = 500000
+
+            # Get tempo
+            for msg in mido.merge_tracks(mid.tracks):
                 if msg.is_meta and msg.type == 'set_tempo':
                     tempo = msg.tempo
                     break
 
-            time_in_seconds = 0.0
-            open_notes = {}
+            # Re-implementation of robust label loading (Time-based)
+            # Returns dict: {frame_idx: label}
+            # Simplified for robustness:
+            # 0=Hover, 1=Press (First 3 frames), 2=Hold, 3=Release (Last 3 frames)
 
-            for msg in mido.merge_tracks(midi.tracks):
-                delta_ticks = msg.time
-                time_in_seconds += mido.tick2second(delta_ticks, ticks_per_beat, tempo)
+            # Reset
+            time_sec = 0.0
+            active_notes = {} # note -> start_time
+            notes_log = [] # (note, start, end)
+
+            for msg in mido.merge_tracks(mid.tracks):
+                time_sec += mido.tick2second(msg.time, mid.ticks_per_beat, tempo)
 
                 if msg.type == 'note_on' and msg.velocity > 0:
-                    open_notes[msg.note] = time_in_seconds
-                elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-                    if msg.note in open_notes:
-                        start_time = open_notes.pop(msg.note)
-                        end_time = time_in_seconds
-                        start_frame = int(start_time * self.fps)
-                        end_frame = int(end_time * self.fps)
+                    active_notes[msg.note] = time_sec
+                elif (msg.type == 'note_off') or (msg.type == 'note_on' and msg.velocity == 0):
+                    if msg.note in active_notes:
+                        start = active_notes.pop(msg.note)
+                        end = time_sec
+                        notes_log.append((msg.note, start, end))
 
-                        if msg.note not in note_events:
-                            note_events[msg.note] = []
-                        note_events[msg.note].append((start_frame, end_frame))
+            return notes_log
 
         except Exception as e:
-            logger.error(f"Could not process MIDI file {midi_file}: {e}")
-        return note_events
-
-    def load_kinematics(self, kinematics_file: Path) -> np.ndarray:
-        """
-        Loads 3D hand kinematics from a JSON annotation file.
-
-        Args:
-            kinematics_file: Path to the kinematics JSON file.
-
-        Returns:
-            A numpy array of shape (frames, 21, 3) representing hand joint coordinates.
-        """
-        try:
-            with kinematics_file.open('r') as f:
-                data = json.load(f)
-
-            # Accommodate both 'right' and 'left' hand data
-            hand_data = data.get('right') or data.get('left')
-            if not hand_data:
-                return None
-
-            # Process frames, padding if necessary
-            processed_frames = []
-            for frame_data in hand_data:
-                if len(frame_data) == 62:
-                    frame_data.append(0)  # Pad to 63 for 21 joints
-
-                if len(frame_data) == 63:
-                    processed_frames.append(np.array(frame_data).reshape(21, 3))
-                else:
-                    # Handle empty or malformed frames
-                    processed_frames.append(np.zeros((21, 3)))
-
-            return np.array(processed_frames)
-
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Error reading or parsing kinematics file {kinematics_file}: {e}")
-            return None
-
-    def _group_chords(self, note_events: dict, window_frames: int = 2) -> list:
-        """
-        Groups MIDI note events that occur within a small time window (e.g., +/- 2 frames)
-        to identify chords.
-
-        Args:
-            note_events: Dict of {note: [(start, end), ...]}
-            window_frames: Time window in frames to group simultaneous notes.
-
-        Returns:
-            List of dicts: [{'start': frame, 'end': frame, 'notes': [note1, note2...]}, ...]
-        """
-        # Flatten all events into a list of (start_frame, end_frame, note)
-        all_events = []
-        for note, events in note_events.items():
-            for start, end in events:
-                all_events.append({'start': start, 'end': end, 'note': note})
-
-        # Sort by start frame
-        all_events.sort(key=lambda x: x['start'])
-
-        if not all_events:
+            logger.error(f"MIDI Error {midi_file}: {e}")
             return []
 
-        chord_groups = []
-        current_group = [all_events[0]]
-
-        for i in range(1, len(all_events)):
-            event = all_events[i]
-            prev_event = current_group[-1]
-
-            # Check if event starts within window of the first event in the current group
-            # Using the first event helps anchor the chord window
-            if abs(event['start'] - current_group[0]['start']) <= window_frames:
-                current_group.append(event)
-            else:
-                # Process completed group
-                group_data = {
-                    'start': int(np.mean([e['start'] for e in current_group])), # Average start frame
-                    'notes': [e['note'] for e in current_group],
-                    # Store individual note durations if needed, but for labeling we might just need to know which fingers
-                    # For simplicity, we'll store the list of events to access individual end times later if needed
-                    'events': current_group
-                }
-                chord_groups.append(group_data)
-                current_group = [event]
-
-        # Append last group
-        if current_group:
-            group_data = {
-                'start': int(np.mean([e['start'] for e in current_group])),
-                'notes': [e['note'] for e in current_group],
-                'events': current_group
-            }
-            chord_groups.append(group_data)
-
-        return chord_groups
-
-    def extract_and_label_features(self, kinematics: np.ndarray, note_events: dict) -> list:
+    def extract_features(self, kinematics_3d: np.ndarray, note_events: List, seq_id: str) -> pd.DataFrame:
         """
-        Extracts 26 features for all fingers and labels them based on MIDI events.
-        Includes chord grouping logic and relative position features.
+        Extracts 2D Features from 3D Kinematics.
+        Labels using Group & Rank heuristic.
         """
-        from scipy.signal import savgol_filter
+        if kinematics_3d is None or len(kinematics_3d) == 0:
+            return pd.DataFrame()
 
-        # Apply Savitzky-Golay filter for smoothing
-        kinematics = savgol_filter(kinematics, window_length=5, polyorder=2, axis=0)
+        num_frames = len(kinematics_3d)
 
-        all_features = []
-        num_frames = kinematics.shape[0]
-        labels = np.zeros((num_frames, 5))  # Labels for 5 fingers: Thumb(0) to Pinky(4)
-        fingertip_indices = [4, 8, 12, 16, 20]  # Landmarks for fingertips
+        # 1. Project 3D -> 2D
+        points_2d = self.project_3d_to_2d(kinematics_3d) # (Frames, 21, 2)
 
-        # --- 1. Label Assignment (Chord Aware) ---
-        chord_groups = self._group_chords(note_events, window_frames=2)
+        # 2. Smooth 2D points
+        points_2d = savgol_filter(points_2d, window_length=5, polyorder=2, axis=0)
 
-        for chord in chord_groups:
-            start_frame = chord['start']
-            notes = chord['notes']
-            events = chord['events']
+        # 3. Calculate Derivatives (2D)
+        # Gradient returns list [grad_axis0, grad_axis1...], we want axis 0 (time)
+        vel_2d = np.gradient(points_2d, axis=0) / self.frame_duration
+        acc_2d = np.gradient(vel_2d, axis=0) / self.frame_duration
 
-            if 0 < start_frame < num_frames:
-                # Get downward velocities (Z-axis) for all 5 fingers at the onset
-                velocities = []
-                for finger_idx in fingertip_indices:
-                    # Use immediate velocity at onset
-                    pos_current = kinematics[start_frame, finger_idx]
-                    pos_prev = kinematics[start_frame - 1, finger_idx]
-                    velocity = (pos_current - pos_prev) / self.frame_duration
-                    velocities.append(velocity[2]) # Z-velocity
+        # 4. Prepare Landmarks
+        # Indices: Wrist=0, Index=8, Middle=12 (Palm Proxy for simplified logic? Original used 9)
+        # Using 9 (Middle MCP) as Palm Center Proxy
+        wrist_pos = points_2d[:, 0, :]
+        palm_pos = points_2d[:, 9, :]
+        wrist_vel = vel_2d[:, 0, :]
 
-                # Rank fingers by velocity (most negative/downward is highest priority)
-                # np.argsort returns indices that would sort the array.
-                # We want smallest (most negative) first.
-                ranked_fingers = np.argsort(velocities)
+        fingertip_indices = [4, 8, 12, 16, 20] # Thumb to Pinky
+        dip_indices = [3, 7, 11, 15, 19]
 
-                # Assign each note to the next-ranked finger
-                # If more notes than fingers, excess notes are ignored (limitation of hand size)
-                for i, event in enumerate(events):
-                    if i < len(ranked_fingers):
-                        finger_idx = ranked_fingers[i] # 0-4 index for labels
-                        note_start = event['start']
-                        note_end = event['end']
+        # Calculate Relative Depth (Normalized Z) - before projection logic loss
+        # Z is index 2. We use the raw kinematics_3d which are normalized/centered in dataset.
+        # rel_depth = tip.z - wrist.z
+        wrist_z_3d = kinematics_3d[:, 0, 2]
 
-                        # Clamp frames to be within the valid range of the labels array
-                        note_start = max(0, min(note_start, num_frames - 1))
-                        note_end = max(0, min(note_end, num_frames))
+        all_rows = []
 
-                        # Skip if the note is invalid or has zero duration
-                        if note_start >= note_end:
-                            continue
+        # Labeling Preparation
+        labels = np.zeros((num_frames, 5), dtype=int)
 
-                        duration = note_end - note_start
-                        press_window = 3
-                        release_window = 3
+        # Group notes by start time (Chord grouping)
+        # Sort by start time
+        note_events.sort(key=lambda x: x[1])
 
-                        # --- 4-State Labeling Logic ---
-                        if duration >= (press_window + release_window):
-                            # Case 1: Long note with Press, Hold, and Release states
-                            # State 1: Press
-                            labels[note_start : note_start + press_window, finger_idx] = 1
-                            # State 2: Hold
-                            labels[note_start + press_window : note_end - release_window, finger_idx] = 2
-                            # State 3: Release
-                            labels[note_end - release_window : note_end, finger_idx] = 3
-                        else:
-                            # Case 2: Short note, prioritize Press then Release
-                            # Calculate midpoint, giving extra frame to Press for odd durations
-                            midpoint = int(np.ceil(duration / 2.0))
+        # Simple grouping: events within 66ms (2 frames)
+        groups = []
+        if note_events:
+            curr_group = [note_events[0]]
+            for i in range(1, len(note_events)):
+                if (note_events[i][1] - curr_group[0][1]) < 0.07: # ~2 frames at 30fps
+                    curr_group.append(note_events[i])
+                else:
+                    groups.append(curr_group)
+                    curr_group = [note_events[i]]
+            groups.append(curr_group)
 
-                            # State 1: Press
-                            labels[note_start : note_start + midpoint, finger_idx] = 1
-                            # State 3: Release
-                            labels[note_start + midpoint : note_end, finger_idx] = 3
+        # Assign labels
+        for group in groups:
+            # Time to frame
+            start_t = np.mean([n[1] for n in group])
+            start_f = int(start_t * self.fps)
 
-        # --- 2. Feature Extraction (Vectorized) ---
-        # Pre-calculate all raw values to support rolling averages and relative features
+            if start_f >= num_frames: continue
 
-        # Landmarks
-        wrist = kinematics[:, 0, :] # (Frames, 3)
-        palm_center = kinematics[:, 9, :] # (Frames, 3) - Using Middle Finger MCP as proxy
+            # Determine which fingers pressed based on Z-velocity (3D)
+            # We use 3D Z-velocity just for the labeling heuristic (Internal Logic)
 
-        # Calculate basic derivatives (Absolute)
-        # Pad with first frame to keep shape
-        velocities = np.gradient(kinematics, axis=0) / self.frame_duration # (Frames, 21, 3)
-        accelerations = np.gradient(velocities, axis=0) / self.frame_duration # (Frames, 21, 3)
+            # Calculate 3D Z-vel for labeling only
+            z_vals = kinematics_3d[:, :, 2]
+            z_vel = np.gradient(z_vals, axis=0)
 
-        # Wrist kinematics (Absolute)
-        wrist_vel = velocities[:, 0, :] # (Frames, 3)
+            finger_z_vels = []
+            for f_idx in fingertip_indices:
+                finger_z_vels.append(z_vel[start_f, f_idx])
 
-        # Process each finger
-        # finger_idx corresponds to 0..4 (Thumb..Pinky)
-        # tip_idx is the MediaPipe landmark index
-        dip_indices = [3, 7, 11, 15, 19] # DIP joints (IP for thumb)
+            # Rank: Most negative (downward) first
+            ranked_indices = np.argsort(finger_z_vels) # Ascending (neg -> pos)
 
-        for frame_idx in range(num_frames):
-            # Skip first few frames if needed for rolling window validness,
-            # but typically we just handle edge cases or accept noisy starts.
-            # The ML pipeline often expects data from frame 0 or 1.
+            # Assign
+            for i, note_tuple in enumerate(group):
+                if i < 5:
+                    f_real_idx = ranked_indices[i] # 0..4
 
-            for finger_i, (tip_idx, dip_idx) in enumerate(zip(fingertip_indices, dip_indices)):
-                features = {}
+                    # Label frames
+                    n_start = int(note_tuple[1] * self.fps)
+                    n_end = int(note_tuple[2] * self.fps)
+                    duration = n_end - n_start
 
-                # -- Raw Vectors --
-                tip_pos_abs = kinematics[frame_idx, tip_idx]
-                tip_vel_abs = velocities[frame_idx, tip_idx]
-                tip_acc_abs = accelerations[frame_idx, tip_idx]
+                    # 4-State Logic
+                    # 1=Press (3 frames), 2=Hold, 3=Release (3 frames)
+                    if duration > 6:
+                        labels[n_start:n_start+3, f_real_idx] = 1
+                        labels[n_start+3:n_end-3, f_real_idx] = 2
+                        labels[n_end-3:n_end, f_real_idx] = 3
+                    else:
+                        mid = n_start + (duration // 2)
+                        labels[n_start:mid, f_real_idx] = 1
+                        labels[mid:n_end, f_real_idx] = 3
 
-                wrist_pos_abs = wrist[frame_idx]
-                wrist_vel_abs = wrist_vel[frame_idx]
+        # Feature Construction
+        for f in range(num_frames):
+            for i, (tip_idx, dip_idx) in enumerate(zip(fingertip_indices, dip_indices)):
+                row = {}
 
-                # -- Relative Calculation (Task A2) --
-                # Position relative to wrist
-                rel_pos = tip_pos_abs - wrist_pos_abs
+                # Base vectors
+                tip_p = points_2d[f, tip_idx]
+                tip_v = vel_2d[f, tip_idx]
+                tip_a = acc_2d[f, tip_idx]
+                wrist_p = wrist_pos[f]
+                wrist_v = wrist_vel[f]
+                palm_p = palm_pos[f]
+                dip_p = points_2d[f, dip_idx]
 
-                # Relative Velocity (Finger Vel - Wrist Vel)
-                rel_vel = tip_vel_abs - wrist_vel_abs
+                # --- NEW 2D FEATURE SET ---
 
-                # -- Feature Mapping to 26 Columns --
+                # 1. Position (Normalized)
+                row['finger_pos_x'] = tip_p[0]
+                row['finger_pos_y'] = tip_p[1]
+                row['wrist_pos_x'] = wrist_p[0]
+                row['wrist_pos_y'] = wrist_p[1]
 
-                # 1. Finger Velocity (Absolute)
-                features['finger_velocity_x'] = tip_vel_abs[0]
-                features['finger_velocity_y'] = tip_vel_abs[1]
-                features['finger_velocity_z'] = tip_vel_abs[2]
+                # 2. Velocity (Normalized/sec)
+                row['finger_vel_x'] = tip_v[0]
+                row['finger_vel_y'] = tip_v[1]
+                row['finger_speed'] = np.linalg.norm(tip_v)
 
-                # 2. Finger Acceleration (Absolute)
-                features['finger_acceleration_x'] = tip_acc_abs[0]
-                features['finger_acceleration_y'] = tip_acc_abs[1]
-                features['finger_acceleration_z'] = tip_acc_abs[2]
+                row['wrist_vel_x'] = wrist_v[0]
+                row['wrist_vel_y'] = wrist_v[1]
+                row['wrist_speed'] = np.linalg.norm(wrist_v)
 
-                # 3. Finger Position (Relative per Task A2)
-                features['finger_position_x'] = rel_pos[0]
-                features['finger_position_y'] = rel_pos[1]
-                features['finger_position_z'] = rel_pos[2]
+                # 3. Acceleration
+                row['finger_acc_x'] = tip_a[0]
+                row['finger_acc_y'] = tip_a[1]
+                row['finger_acc_mag'] = np.linalg.norm(tip_a)
 
-                # 4. Depth Feature (Relative Z)
-                features['depth_feature'] = rel_pos[2]
+                # 4. Relative (Tip - Wrist)
+                rel_pos = tip_p - wrist_p
+                rel_vel = tip_v - wrist_v
+                row['rel_finger_pos_x'] = rel_pos[0]
+                row['rel_finger_pos_y'] = rel_pos[1]
+                row['rel_finger_vel_x'] = rel_vel[0]
+                row['rel_finger_vel_y'] = rel_vel[1]
 
-                # 5. Posture / Euclidean Distance (Tip to DIP/IP)
-                dip_pos_abs = kinematics[frame_idx, dip_idx]
-                posture = np.linalg.norm(tip_pos_abs - dip_pos_abs)
-                features['posture_feature'] = posture
-                features['euclidean_distance'] = posture # Duplicate as per ML pipeline expectation
+                # 5. Distances
+                row['dist_wrist'] = np.linalg.norm(rel_pos)
+                row['dist_palm'] = np.linalg.norm(tip_p - palm_p)
+                row['posture_dist'] = np.linalg.norm(tip_p - dip_p) # Tip to DIP
 
-                # 6. Distance from Wrist
-                features['distance_from_wrist'] = np.linalg.norm(rel_pos)
+                # 6. Relative Depth (New for Phase 2.5)
+                # Use raw 3D Z difference: tip.z - wrist.z
+                # This matches MediaPipe's wrist-relative landmark.z behavior
+                tip_z_3d = kinematics_3d[f, tip_idx, 2]
+                row['rel_depth'] = tip_z_3d - wrist_z_3d[f]
 
-                # 7. Fingertip to Palm Center
-                palm_pos_abs = palm_center[frame_idx]
-                features['fingertip_to_palm_center_distance'] = np.linalg.norm(tip_pos_abs - palm_pos_abs)
+                # 7. Rolling Averages (Last 5 frames)
+                s_idx = max(0, f-4)
+                row['avg_speed'] = np.mean(np.linalg.norm(vel_2d[s_idx:f+1, tip_idx], axis=1))
+                row['avg_acc_mag'] = np.mean(np.linalg.norm(acc_2d[s_idx:f+1, tip_idx], axis=1))
 
-                # 8. Wrist Velocity (Absolute)
-                features['wrist_velocity_x'] = wrist_vel_abs[0]
-                features['wrist_velocity_y'] = wrist_vel_abs[1]
-                features['wrist_velocity_z'] = wrist_vel_abs[2]
-
-                # 9. Relative Velocity
-                features['relative_velocity_x'] = rel_vel[0]
-                features['relative_velocity_y'] = rel_vel[1]
-                features['relative_velocity_z'] = rel_vel[2]
-
-                # 10. Avg Velocity/Acceleration (Rolling Window)
-                # We need to look back. Simple approach: average last 5 frames (inclusive)
-                start_w = max(0, frame_idx - 4)
-                window_vel = velocities[start_w : frame_idx+1, tip_idx]
-                window_acc = accelerations[start_w : frame_idx+1, tip_idx]
-
-                avg_vel = np.mean(window_vel, axis=0)
-                avg_acc = np.mean(window_acc, axis=0)
-
-                features['avg_velocity_x'] = avg_vel[0]
-                features['avg_velocity_y'] = avg_vel[1]
-                features['avg_velocity_z'] = avg_vel[2]
-
-                features['avg_acceleration_x'] = avg_acc[0]
-                features['avg_acceleration_y'] = avg_acc[1]
-                features['avg_acceleration_z'] = avg_acc[2]
-
-                # 11. Finger Speed (Magnitude of Velocity)
-                features['finger_speed'] = np.linalg.norm(tip_vel_abs)
-
-                # 12. Lag Features for Z-axis Velocity and Acceleration
+                # 8. Lags (Speed)
                 for lag in [2, 4, 6]:
-                    if frame_idx >= lag:
-                        features[f'velocity_z_lag_{lag}'] = velocities[frame_idx - lag, tip_idx, 2]
+                    if f >= lag:
+                        l_idx = f - lag
+                        row[f'lag_speed_{lag}'] = np.linalg.norm(vel_2d[l_idx, tip_idx])
                     else:
-                        features[f'velocity_z_lag_{lag}'] = 0.0
+                        row[f'lag_speed_{lag}'] = 0.0
 
-                for lag in [2, 4]:
-                    if frame_idx >= lag:
-                        features[f'acceleration_z_lag_{lag}'] = accelerations[frame_idx - lag, tip_idx, 2]
+                # 9. Rolling Variance (Stability)
+                if f > 4:
+                    row['rolling_var_speed'] = np.var(np.linalg.norm(vel_2d[s_idx:f+1, tip_idx], axis=1))
+                else:
+                    row['rolling_var_speed'] = 0.0
+
+                # Meta
+                row['sequence_id'] = seq_id
+                row['ground_truth_label'] = labels[f, i]
+
+                all_rows.append(row)
+
+        return pd.DataFrame(all_rows)
+
+
+    def yield_batch(self, batch_size: int = 5) -> Generator[pd.DataFrame, None, None]:
+        """
+        Generator that yields DataFrames of features in batches of files.
+        """
+        # Ensure data is ready
+        self.downloader.download()
+
+        sequences = self.parser.list_sequences()
+        logger.info(f"Found {len(sequences)} sequences.")
+
+        current_batch = []
+
+        for seq_meta in sequences:
+            # Load Data
+            try:
+                # Load JSON
+                with open(seq_meta['pose_path'], 'r') as f:
+                    raw = json.load(f)
+                    # Handle structure variants
+                    if 'right' in raw:
+                        data = raw['right']
+                    elif 'left' in raw:
+                        data = raw['left']
+                    elif isinstance(raw, list):
+                         data = raw
                     else:
-                        features[f'acceleration_z_lag_{lag}'] = 0.0
+                        continue # Skip unknown format
 
-                # 13. Rolling Variance for Z-axis Velocity and Acceleration
-                # Window of 5 frames
-                start_w_var = max(0, frame_idx - 4)
-                window_vel_z = velocities[start_w_var : frame_idx+1, tip_idx, 2]
-                window_acc_z = accelerations[start_w_var : frame_idx+1, tip_idx, 2]
+                # Fix shape
+                frames = []
+                for fr in data:
+                    if len(fr) == 63: frames.append(np.array(fr).reshape(21, 3))
+                    elif len(fr) == 62: frames.append(np.array(fr + [0]).reshape(21, 3))
 
-                features['rolling_variance_velocity_z'] = np.var(window_vel_z)
-                features['rolling_variance_acceleration_z'] = np.var(window_acc_z)
+                points_3d = np.array(frames)
 
-                # Label
-                features['ground_truth_label'] = labels[frame_idx, finger_i]
+                # Load MIDI
+                note_events = self.load_midi_labels(seq_meta['midi_path'])
 
-                all_features.append(features)
+                # Extract
+                df = self.extract_features(points_3d, note_events, seq_meta['sequence'])
 
-        return all_features
+                if not df.empty:
+                    current_batch.append(df)
+
+            except Exception as e:
+                logger.warning(f"Failed to process {seq_meta['sequence']}: {e}")
+                continue
+
+            # Yield if batch full
+            if len(current_batch) >= batch_size:
+                yield pd.concat(current_batch, ignore_index=True)
+                current_batch = []
+
+        # Yield remaining
+        if current_batch:
+            yield pd.concat(current_batch, ignore_index=True)
 
     def run(self, max_files=None, output_csv="features.csv"):
         """
-        Main entry point to run the dataset generation.
-
-        Args:
-            max_files: The maximum number of file pairs to process.
-            output_csv: The name of the output CSV file.
+        Legacy entry point: Processes all (or max) files and saves CSV.
         """
-        logger.info("Starting dataset generation...")
+        all_dfs = []
+        gen = self.yield_batch(batch_size=5)
 
-        # If we are running from the script directory, we can try to find files relative to it
-        # But the plan suggests we might just run it from repo root.
-        # The original code used self.dataset_dir passed in init.
+        count = 0
+        try:
+            for df_batch in gen:
+                all_dfs.append(df_batch)
+                count += len(df_batch['sequence_id'].unique())
+                if max_files and count >= max_files:
+                    break
+        except StopIteration:
+            pass
 
-        annotation_dir = self.dataset_dir # / "annotation" / "annotation" # Adjusted based on file structure
-        # Wait, the original code had nested paths. Let's check list_files.
-        # The file list shows BV...json in Code/Data_Pipeline.
-        # If the user wants me to use the LOCAL sample files, I should point to them.
-        # But the class is designed for the full dataset structure.
-        # I will adapt it to look in dataset_dir directly if the nested structure is missing.
-
-        # Check for sample files in the current directory (Code/Data_Pipeline)
-        # If dataset_dir is passed as '.', we might find them.
-
-        all_features = []
-
-        # Robust file finding
-        # Try finding JSONs recursively
-        kinematics_files = list(self.dataset_dir.rglob("*.json"))
-
-        if max_files:
-            kinematics_files = kinematics_files[:max_files]
-
-        logger.info(f"Found {len(kinematics_files)} kinematics files.")
-
-        for kinematics_file in tqdm(kinematics_files, desc="Processing files"):
-            # Attempt to find matching MIDI
-            # Assuming naming convention: BV1Jf421Z732_seq_0000.json -> BV1Jf421Z732.mid
-            # The sequence suffix might not be in the MIDI filename if MIDI is per-video/session.
-
-            # Strategy: Try to find a .mid file with the prefix of the json file
-            file_stem = kinematics_file.stem
-            # Remove _seq_XXXX
-            base_name = file_stem.split('_seq_')[0]
-
-            # Look in same dir or recursively
-            midi_candidates = list(self.dataset_dir.rglob(f"{base_name}.mid"))
-
-            if midi_candidates:
-                midi_file = midi_candidates[0]
-
-                kinematics = self.load_kinematics(kinematics_file)
-                note_events = self.load_midi_labels(midi_file)
-
-                if kinematics is not None and note_events:
-                    features = self.extract_and_label_features(kinematics, note_events)
-
-                    # Add sequence_id to each feature row
-                    sequence_id = kinematics_file.stem
-                    for feature_row in features:
-                        feature_row['sequence_id'] = sequence_id
-
-                    all_features.extend(features)
-            else:
-                logger.warning(f"MIDI file not found for {kinematics_file} (Base: {base_name})")
-
-        if not all_features:
-            logger.warning("No features were extracted. The dataset might be empty or paths are incorrect.")
-            return
-
-        df = pd.DataFrame(all_features)
-
-        # Determine project root and save to the correct Data directory
-        # Assuming this script is in Machine_Learning_Course/Code/Data_Pipeline
-        project_root = Path(__file__).resolve().parent.parent.parent.parent
-        # Wait, __file__ is .../Code/Data_Pipeline/Sync.py
-        # parent -> Pipeline
-        # parent -> Code
-        # parent -> Course
-        # parent -> Root
-        # Actually, let's just use relative path "Data/PianoMotion10M" from where we run, or fixed path.
-
-        # If running from repo root: Machine_Learning_Course/Data/PianoMotion10M
-        output_dir = Path("Machine_Learning_Course/Data/PianoMotion10M")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / output_csv
-
-        df.to_csv(output_path, index=False)
-
-        logger.info(f"Dataset generation complete. Saved to {output_path}")
-        logger.info(f"Generated {len(df)} samples.")
-        logger.info(f"Label distribution:\n{df['ground_truth_label'].value_counts()}")
-
+        if all_dfs:
+            final_df = pd.concat(all_dfs, ignore_index=True)
+            out_path = self.dataset_dir / output_csv
+            final_df.to_csv(out_path, index=False)
+            logger.info(f"Saved {len(final_df)} samples to {out_path}")
+        else:
+            logger.warning("No data generated.")
 
 if __name__ == "__main__":
-    # Use the directory where this script is located as the default dataset dir for the sample files
-    script_dir = Path(__file__).parent
-
-    # For the sample run, we point to the script dir where the sample files are
-    processor = SyncPianoMotionDataset(dataset_dir=script_dir)
-    processor.run(max_files=None)
+    # Test Run
+    dataset = SyncPianoMotionDataset()
+    dataset.run(max_files=2)
